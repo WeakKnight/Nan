@@ -149,7 +149,8 @@ class App:
             elif event.key == spy.KeyCode.f11 and self.render_doc_is_available:
                 self.should_capture = True
 
-        self.camera_controller.on_keyboard_event(event)
+        if not self.ui.handle_keyboard_event(event):
+            self.camera_controller.on_keyboard_event(event)
 
     def on_mouse_event(self, event: spy.MouseEvent):
         if self.headless or self.ui is None:
