@@ -2,6 +2,8 @@
 
 A real-time GPU path tracing renderer built with SlangPy.
 
+![Demo](demo.png)
+
 ## Quick Start
 
 ```bash
