@@ -1,6 +1,6 @@
 # Nan - Python + Slang GPU Path Tracer
 
-A real-time GPU path tracing renderer built with SlangPy.
+An educational real-time GPU path tracing renderer built with SlangPy.
 
 ![Demo](demo.png)
 
