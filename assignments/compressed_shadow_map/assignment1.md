@@ -256,44 +256,13 @@ float visibility = get_visibility_shadow_map(sd.position);
    - Sample shadow map multiple times and average results
    - Produces soft shadow edges
 
-### Why Ray Traced Shadow Maps?
-
-You might wonder why we use ray tracing to generate shadow maps when we could just use ray tracing for direct visibility tests (which is what we're replacing). This is a **learning exercise** to understand:
-
-1. How shadow maps work conceptually
-2. The trade-offs between per-pixel ray queries vs. cached depth information
-3. Shadow map artifacts (aliasing, acne, peter panning) that don't exist in pure ray tracing
-
-In practice, ray traced visibility is often superior, but shadow maps remain important for understanding classical real-time rendering techniques.
-
 ### Bonus (Optional)
 
 1. Implement PCF soft shadows
-2. Implement Cascaded Shadow Maps (CSM) for better shadow quality at distance
-3. Add UI controls for shadow map resolution and bias parameters
-
----
-
-## Submission Requirements
-
-1. Modified source code files
-2. Screenshots demonstrating both tasks
-3. Brief explanation of your implementation approach and any issues encountered
-
-## Grading Rubric
-
-| Item | Points |
-|------|--------|
-| Task 1: Basic exposure functionality | 30 |
-| Task 1: UI controls (optional) | 10 |
-| Task 2: Basic shadow map functionality | 40 |
-| Task 2: Shadow bias handling | 10 |
-| Task 2: PCF soft shadows (optional) | 10 |
 
 ---
 
 ## References
 
 - [Learn OpenGL - Shadow Mapping](https://learnopengl.com/Advanced-Lighting/Shadows/Shadow-Mapping)
-- [ACES Filmic Tone Mapping](https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/)
 - [Percentage-Closer Filtering](https://developer.nvidia.com/gpugems/gpugems/part-ii-lighting-and-shadows/chapter-11-shadow-map-antialiasing)
