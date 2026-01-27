@@ -77,13 +77,6 @@ Include new shaders via `device.load_program(..., ["entry_point"])`; ensure host
 
 ---
 
-## Resources & LUTs
-- HDR assets: `plains_sunset_2k.exr` (default env), `envmap.exr` (legacy fallback).
-- Atmospheric LUTs: `sky_view_lut.png`, `transmittance_lut.png`, `multiscatt_lut.png`; produced by `atmosphere.py` experiments.
-- Example scenes & meshes live under `examples/`; structured by scenario with reusable object libraries.
-
----
-
 ## UI, Input & Events
 - Camera: WASD + mouse look; `CameraController.update` publishes `"camera_move"` when position/orientation changes.
 - Hotkeys: `Esc` quit, `F1` TEV viewer, `F2` screenshot, `F11` RenderDoc capture toggle.
