@@ -21,7 +21,7 @@ python entry_point.py
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--scene <path>` | Scene file path (.json or model file) | Cornell box |
+| `--scene <path>` | Scene file path | Cornell box |
 | `--headless` | Run without window | - |
 | `--frames <N>` | Number of frames in headless mode | 64 |
 | `--output <path>` | Output image path for headless mode | headless_output.png |
