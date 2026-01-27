@@ -1,8 +1,14 @@
 # Nan - Python + Slang GPU Path Tracer
 
-An educational real-time GPU path tracing renderer built with SlangPy.
+An **educational** real-time GPU path tracing renderer built with SlangPy.
 
 ![Demo](demo.png)
+
+## Features
+
+- **Simple unidirectional path tracing** - Easy to understand and extend
+- **Lambert BSDF only** - No complex material models, perfect for learning
+- **Headless mode** - Render without a window, ideal for AI-assisted debugging
 
 ## Quick Start
 
