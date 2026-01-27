@@ -1,0 +1,7 @@
+__pycache__
+*.lz4
+*.rad
+code_ref/
+.claude/
+.codebuddy/
+headless_output.png

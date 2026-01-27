@@ -1,0 +1,6 @@
+slangpy
+numpy
+trimesh
+OpenEXR
+event-dispatching
+pygltflib
