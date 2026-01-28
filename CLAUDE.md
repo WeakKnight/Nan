@@ -1,4 +1,4 @@
-# Path Tracer – Agent Guide
+# Agent Guide
 
 ## Purpose & Scope
 - Real-time GPU path tracer, authored in Python + Slang via SlangPy.
@@ -9,7 +9,7 @@
 
 ## Runtime Flow
 1. `entry_point.py` creates a `PathTracingRenderer`.
-2. `App` (window, device, swapchain, UI) loads a JSON/asset scene through `SceneNode` → `Scene`.
+2. `App` (window, device, swapchain, UI) loads an asset scene through `SceneNode` → `Scene`.
 3. Camera/controller feeds jittered view data; event dispatcher announces camera/key changes.
 4. Renderer orchestrates compute passes (path tracing, accumulation, tonemap) on `spy.CommandEncoder`.
 5. Output textures blit to the surface; UI draws; optional RenderDoc/TEV capture hooks run.
@@ -39,7 +39,7 @@
 - `event_dispatcher` (external dependency) – Pub/sub used for camera/key notifications.
 
 ### Scene & Assets
-- `scene_node.py` – High-level scene graph, asset + JSON loading, axis conversion (`"z_up_to_y_up"`), material extraction fallback chain.
+- `scene_node.py` – High-level scene graph, asset loading, axis conversion (`"z_up_to_y_up"`), material extraction fallback chain.
 - `scene.py` – GPU-ready scene (descriptors, buffers, BLAS/TLAS builds, env map).
 - `Scene.md` – Supplemental deep dive into scene packing (reference when editing descriptors).
 - `mesh.py`, `material.py`, `transform.py` – Data containers for scene construction.
@@ -70,7 +70,7 @@ Include new shaders via `device.load_program(..., ["entry_point"])`; ensure host
 ---
 
 ## Scene & Asset Workflow
-- Preferred entry path: `SceneNode.load_json("examples/...")`; axis conversion defaults to `"none"` but `"z_up_to_y_up"` handles common DCC exports.
+- Axis conversion defaults to `"none"` but `"z_up_to_y_up"` handles common DCC exports.
 - Asset loader supports OBJ/STL/PLY/glTF/OFF/3MF/Collada. Materials default to extracted diffuse → vertex color → provided override → neutral gray.
 - Camera metadata from JSON seeds `CameraController`. If not provided, `SceneNode` creates a default camera aimed at the scene bounds.
 - Instancing: `SceneNode.add_scene_node` reuses meshes/materials; `Scene` flags odd-negative transforms to maintain correct winding.
