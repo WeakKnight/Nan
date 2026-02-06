@@ -9,17 +9,10 @@ struct DirectionalLight {
     float cos_half_angle;       // cos(half_apex_angle), for cone sampling. Default: cos(0.2725°) ≈ 0.99999
     float3 color;               // Light color (default: white)
     float intensity;            // Light intensity in outer space (default: PI ≈ 3.14159)
-    float3 transmittance;       // Atmospheric transmittance toward sun (computed from sun elevation)
-    float pad0;
     
     // Outer space illuminance (used for sky LUT, which already includes scattering)
     float3 get_outer_space_illuminance() {
         return color * intensity;
-    }
-    
-    // Ground-level illuminance after atmospheric attenuation (used for NEE direct lighting)
-    float3 get_ground_illuminance() {
-        return color * intensity * transmittance;
     }
 };
 
@@ -46,6 +39,9 @@ struct Scene {
 
     StructuredBuffer<float4x4> transforms;
     StructuredBuffer<float4x4> inverse_transpose_transforms;
+
+    Texture2D<float4> transmittance_lut;
+    SamplerState transmittance_sampler;
 
     Texture2D<float4> sky_view_lut;
     SamplerState linear_sampler;
@@ -293,8 +289,7 @@ struct Scene {
         
         if (view_dot_light > cos_half_apex)
         {
-            // Get atmospheric transmittance
-            float3 transmittance = directional_light.transmittance;
+            float3 transmittance = get_sun_transmittance_at_view();
             
             // Calculate sun disk luminance from illuminance
             float solid_angle = 2.0 * PI * (1.0 - cos_half_apex);
@@ -405,10 +400,24 @@ struct Scene {
         // 
         // Use ground-level illuminance which includes atmospheric transmittance
         // (light is attenuated as it travels through the atmosphere to reach the surface)
-        float3 illuminance = directional_light.get_ground_illuminance();
+        float3 illuminance = directional_light.get_outer_space_illuminance() * get_sun_transmittance_at_view();
         float3 radiance = visibility * f * illuminance * NdotL;
         
         return float4(radiance, pdf);
+    }
+
+    float3 get_sun_transmittance_at_view()
+    {
+        float height = length(viewPos);
+        float3 up = viewPos / height;
+        float sunCosZenithAngle = dot(normalize(directional_light.direction), up);
+
+        float2 uv = float2(
+            clamp(0.5 + 0.5 * sunCosZenithAngle, 0.0, 1.0),
+            clamp((height - groundRadiusMM) / (atmosphereRadiusMM - groundRadiusMM), 0.0, 1.0)
+        );
+
+        return transmittance_lut.SampleLevel(transmittance_sampler, uv, 0).rgb;
     }
 
     float get_linear_depth(float3 world_position)

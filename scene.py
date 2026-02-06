@@ -25,156 +25,6 @@ from sun_position import SunPosition, SunPositionData
 from texture_manager import TextureManager, TextureType, TextureRecord
 
 
-class AtmosphereTransmittance:
-    """
-    Calculate atmospheric transmittance toward the sun based on sun elevation angle.
-    
-    Uses simplified Rayleigh + Mie + Ozone absorption model matching UE's SkyAtmosphere.
-    Reference: SkyAtmosphereCommonData.cpp GetTransmittanceAtGroundLevel()
-    """
-    
-    # Atmosphere parameters (in Mm = megameters = 1000 km)
-    BOTTOM_RADIUS_MM = 6.360     # Earth radius in Mm
-    TOP_RADIUS_MM = 6.460        # Atmosphere top in Mm
-    
-    # Rayleigh scattering (wavelength-dependent, causes blue sky)
-    RAYLEIGH_DENSITY_EXP_SCALE = -1.0 / 0.008  # Scale height ~8km
-    RAYLEIGH_SCATTERING = (0.005802, 0.013558, 0.033100)  # RGB scattering coefficients
-    
-    # Mie scattering (aerosols, wavelength-independent)
-    MIE_DENSITY_EXP_SCALE = -1.0 / 0.0012  # Scale height ~1.2km
-    MIE_EXTINCTION = (0.004440, 0.004440, 0.004440)  # Equal across RGB
-    
-    # Ozone absorption (absorbs in UV and some visible)
-    ABSORPTION_EXTINCTION = (0.000650, 0.001881, 0.000085)
-    ABSORPTION_DENSITY_0_LAYER_WIDTH = 0.025  # 25km
-    ABSORPTION_DENSITY_0_CONSTANT_TERM = -2.0 / 3.0
-    ABSORPTION_DENSITY_0_LINEAR_TERM = 1.0 / 0.015  # 15km scale
-    ABSORPTION_DENSITY_1_CONSTANT_TERM = 8.0 / 3.0
-    ABSORPTION_DENSITY_1_LINEAR_TERM = -1.0 / 0.015
-    
-    # Minimum elevation angle for transmittance calculation (avoid divide by zero)
-    MIN_ELEVATION_ANGLE = -5.0  # degrees
-    
-    @staticmethod
-    def calculate(sun_direction: Tuple[float, float, float]) -> Tuple[float, float, float]:
-        """
-        Calculate atmospheric transmittance for light traveling from the sun to ground level.
-        
-        Args:
-            sun_direction: Unit vector pointing toward the sun (x, y, z) in Y-up coords
-            
-        Returns:
-            RGB transmittance values (0 to 1), representing how much light passes through
-        """
-        # Get sun elevation from direction (Y is up)
-        elevation_rad = math.asin(max(-1.0, min(1.0, sun_direction[1])))
-        elevation_deg = math.degrees(elevation_rad)
-        
-        # Clamp to minimum elevation to avoid extreme values
-        elevation_deg = max(AtmosphereTransmittance.MIN_ELEVATION_ANGLE, elevation_deg)
-        elevation_rad = math.radians(elevation_deg)
-        
-        # World position: 500m above ground (like UE)
-        world_pos_z = AtmosphereTransmittance.BOTTOM_RADIUS_MM + 0.0005  # 0.5 Mm = 500m
-        world_pos = (0.0, 0.0, world_pos_z)
-        
-        # World direction: based on elevation (azimuth doesn't matter due to symmetry)
-        world_dir = (math.cos(elevation_rad), 0.0, math.sin(elevation_rad))
-        
-        # Calculate optical depth by ray marching
-        optical_depth = AtmosphereTransmittance._calculate_optical_depth(world_pos, world_dir)
-        
-        # Transmittance = exp(-optical_depth)
-        transmittance = (
-            math.exp(-optical_depth[0]),
-            math.exp(-optical_depth[1]),
-            math.exp(-optical_depth[2])
-        )
-        
-        return transmittance
-    
-    @staticmethod
-    def _ray_sphere_intersect(ray_origin, ray_dir, sphere_radius):
-        """Find nearest intersection of ray with sphere centered at origin."""
-        # Quadratic coefficients: at² + bt + c = 0
-        a = ray_dir[0]**2 + ray_dir[1]**2 + ray_dir[2]**2
-        b = 2.0 * (ray_origin[0]*ray_dir[0] + ray_origin[1]*ray_dir[1] + ray_origin[2]*ray_dir[2])
-        c = ray_origin[0]**2 + ray_origin[1]**2 + ray_origin[2]**2 - sphere_radius**2
-        
-        discriminant = b*b - 4*a*c
-        if discriminant < 0:
-            return -1.0
-        
-        sqrt_disc = math.sqrt(discriminant)
-        t0 = (-b - sqrt_disc) / (2*a)
-        t1 = (-b + sqrt_disc) / (2*a)
-        
-        if t0 < 0 and t1 < 0:
-            return -1.0
-        if t0 < 0:
-            return max(0.0, t1)
-        if t1 < 0:
-            return max(0.0, t0)
-        return max(0.0, min(t0, t1))
-    
-    @staticmethod
-    def _calculate_optical_depth(world_pos, world_dir):
-        """Ray march through atmosphere to calculate optical depth."""
-        # Find intersection with atmosphere top
-        t_max = AtmosphereTransmittance._ray_sphere_intersect(
-            world_pos, world_dir, AtmosphereTransmittance.TOP_RADIUS_MM
-        )
-        
-        if t_max <= 0:
-            return (0.0, 0.0, 0.0)
-        
-        optical_depth = [0.0, 0.0, 0.0]
-        sample_count = 15
-        sample_step = 1.0 / sample_count
-        sample_length = sample_step * t_max
-        
-        for i in range(sample_count):
-            t = (i + 0.5) * sample_step * t_max
-            pos = (
-                world_pos[0] + world_dir[0] * t,
-                world_pos[1] + world_dir[1] * t,
-                world_pos[2] + world_dir[2] * t
-            )
-            
-            # Height above ground
-            height = math.sqrt(pos[0]**2 + pos[1]**2 + pos[2]**2)
-            view_height = height - AtmosphereTransmittance.BOTTOM_RADIUS_MM
-            
-            # Rayleigh density
-            density_ray = max(0.0, math.exp(AtmosphereTransmittance.RAYLEIGH_DENSITY_EXP_SCALE * view_height))
-            
-            # Mie density
-            density_mie = max(0.0, math.exp(AtmosphereTransmittance.MIE_DENSITY_EXP_SCALE * view_height))
-            
-            # Ozone density (peaks around 25km)
-            if view_height < AtmosphereTransmittance.ABSORPTION_DENSITY_0_LAYER_WIDTH:
-                density_ozo = max(0.0, min(1.0,
-                    AtmosphereTransmittance.ABSORPTION_DENSITY_0_LINEAR_TERM * view_height +
-                    AtmosphereTransmittance.ABSORPTION_DENSITY_0_CONSTANT_TERM
-                ))
-            else:
-                density_ozo = max(0.0, min(1.0,
-                    AtmosphereTransmittance.ABSORPTION_DENSITY_1_LINEAR_TERM * view_height +
-                    AtmosphereTransmittance.ABSORPTION_DENSITY_1_CONSTANT_TERM
-                ))
-            
-            # Extinction = scattering + absorption
-            for c in range(3):
-                extinction = (
-                    density_mie * AtmosphereTransmittance.MIE_EXTINCTION[c] +
-                    density_ray * AtmosphereTransmittance.RAYLEIGH_SCATTERING[c] +
-                    density_ozo * AtmosphereTransmittance.ABSORPTION_EXTINCTION[c]
-                )
-                optical_depth[c] += sample_length * extinction
-        
-        return tuple(optical_depth)
-
 class Scene:
     # Instance flags (must match InstanceFlags in common.slang)
     INSTANCE_FLAG_NONE = 0
@@ -239,6 +89,14 @@ class Scene:
         self.event_distpacher: SyncEventDispatcher = event_distpacher
 
         self.linear_sampler: Sampler = device.create_sampler()
+        self.transmittance_sampler: Sampler = device.create_sampler(
+            address_u=spy.TextureAddressingMode.clamp_to_edge,
+            address_v=spy.TextureAddressingMode.clamp_to_edge,
+            address_w=spy.TextureAddressingMode.clamp_to_edge,
+            min_filter=spy.TextureFilteringMode.linear,
+            mag_filter=spy.TextureFilteringMode.linear,
+            mip_filter=spy.TextureFilteringMode.linear,
+        )
         self.camera: Camera = scene_node.camera
         self.asset_path: str = scene_node.asset_path
         
@@ -784,19 +642,13 @@ class Scene:
         cursor["indices"] = self.index_buffer
         cursor["transforms"] = self.transform_buffer
         cursor["inverse_transpose_transforms"] = self.inverse_transpose_transforms_buffer
+        cursor["transmittance_lut"] = self.transmittance_lut_gen.get_texture()
+        cursor["transmittance_sampler"] = self.transmittance_sampler
         cursor["sky_view_lut"] = self.sky_view_lut_gen.get_texture()
         cursor["linear_sampler"] = self.linear_sampler
         cursor["sun_direction"] = self._sun_direction
         cursor["instance_count"] = len(self.instance_descs)
         cursor["frame_index"] = self._frame_index
-        
-        # Calculate atmospheric transmittance based on sun direction
-        sun_dir_tuple = (
-            float(self._sun_direction[0]),
-            float(self._sun_direction[1]),
-            float(self._sun_direction[2])
-        )
-        transmittance = AtmosphereTransmittance.calculate(sun_dir_tuple)
         
         # Bind directional light parameters
         # Direction is same as sun_direction (pointing toward the sun)
@@ -804,6 +656,5 @@ class Scene:
         cursor["directional_light"]["cos_half_angle"] = self._directional_light_cos_half_angle
         cursor["directional_light"]["color"] = self._directional_light_color
         cursor["directional_light"]["intensity"] = self._directional_light_intensity
-        cursor["directional_light"]["transmittance"] = spy.float3(transmittance[0], transmittance[1], transmittance[2])
         
         self.camera.bind(cursor["camera"])
