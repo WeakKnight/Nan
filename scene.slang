@@ -317,7 +317,7 @@ struct Scene {
         float3 up = viewPos / height;
         
         float horizonAngle = safeacos(sqrt(height * height - groundRadiusMM * groundRadiusMM) / height) - 0.5 * PI;
-        float altitudeAngle = asin(dot(rayDir, up)); // Between -PI/2 and PI/2
+        float altitudeAngle = clamp(asin(dot(rayDir, up)), -0.5 * PI + 1e-2, 0.5 * PI - 1e-2); // Between -PI/2 and PI/2
         
         // Compute azimuth relative to sun direction
         float azimuthAngle; // Between -PI and PI
