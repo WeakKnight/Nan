@@ -222,6 +222,7 @@ enum TextureFlags
     HasRoughnessTex = 1 << 2,
     HasMetallicTex = 1 << 3,
     HasEmissiveTex = 1 << 4,
+    HasSpecularColorTex = 1 << 5,
 };
 
 // Alpha modes (matches glTF spec)
@@ -239,15 +240,14 @@ struct MaterialDesc {
     uint texture_flags;  // Bitmask indicating which textures are present
     uint alpha_mode;     // AlphaMode: OPAQUE=0, MASK=1, BLEND=2
     float alpha_cutoff;  // Alpha cutoff threshold (default 0.5)
-    uint pad0;
-    uint pad1;
-    uint pad2;
+    float3 specular_color; // Specular color (default white)
     // Bindless texture handles
     Texture2D<float4>.Handle base_color_tex_handle;
     Texture2D<float4>.Handle normal_tex_handle;
     Texture2D<float4>.Handle roughness_tex_handle;
     Texture2D<float4>.Handle metallic_tex_handle;
     Texture2D<float4>.Handle emissive_tex_handle;
+    Texture2D<float4>.Handle specular_color_tex_handle;
 
     bool is_double_sided()
     {
@@ -277,6 +277,11 @@ struct MaterialDesc {
     bool has_emissive_texture()
     {
         return (bool)(texture_flags & (uint)TextureFlags::HasEmissiveTex);
+    }
+    
+    bool has_specular_color_texture()
+    {
+        return (bool)(texture_flags & (uint)TextureFlags::HasSpecularColorTex);
     }
 };
 

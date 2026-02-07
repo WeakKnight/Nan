@@ -124,6 +124,7 @@ class SceneNode:
         # Default values
         base_color = spy.float3(0.8, 0.8, 0.8)
         emissive = spy.float3(0.0, 0.0, 0.0)
+        specular_color = spy.float3(1.0, 1.0, 1.0)
         roughness = 0.5
         metallic = 0.0
         
@@ -133,6 +134,7 @@ class SceneNode:
         roughness_texture = None
         metallic_texture = None
         emissive_texture = None
+        specular_color_texture = None
         
         # Alpha related
         alpha_mode = ALPHA_MODE_OPAQUE
@@ -253,6 +255,12 @@ class SceneNode:
                         metallic_texture = tex_info['metallicRoughnessTexture']
                     if not emissive_texture and tex_info.get('emissiveTexture'):
                         emissive_texture = tex_info['emissiveTexture']
+                    if not specular_color_texture and tex_info.get('specularColorTexture'):
+                        specular_color_texture = tex_info['specularColorTexture']
+                    # Extract specular color factor
+                    if tex_info.get('specularColorFactor') is not None:
+                        sc = tex_info['specularColorFactor']
+                        specular_color = spy.float3(float(sc[0]), float(sc[1]), float(sc[2]))
                     # Get alpha mode/cutoff from gltf_textures if not already set
                     if alpha_mode == ALPHA_MODE_OPAQUE and tex_info.get('alphaMode'):
                         mode_str = tex_info['alphaMode'].upper() if isinstance(tex_info['alphaMode'], str) else tex_info['alphaMode']
@@ -278,17 +286,19 @@ class SceneNode:
             return default
         
         # Debug: print extracted texture paths
-        if base_color_texture or normal_texture or roughness_texture or metallic_texture or emissive_texture:
+        if base_color_texture or normal_texture or roughness_texture or metallic_texture or emissive_texture or specular_color_texture:
             print(f"[SceneNode] Extracted textures:")
             print(f"  base_color: {base_color_texture}")
             print(f"  normal: {normal_texture}")
             print(f"  roughness: {roughness_texture}")
             print(f"  metallic: {metallic_texture}")
             print(f"  emissive: {emissive_texture}")
+            print(f"  specular_color: {specular_color_texture}")
         
         return Material(
             base_color=base_color,
             emissive=emissive,
+            specular_color=specular_color,
             roughness=roughness,
             metallic=metallic,
             base_color_texture=base_color_texture,
@@ -296,6 +306,7 @@ class SceneNode:
             roughness_texture=roughness_texture,
             metallic_texture=metallic_texture,
             emissive_texture=emissive_texture,
+            specular_color_texture=specular_color_texture,
             alpha_mode=alpha_mode,
             alpha_cutoff=alpha_cutoff
         )
@@ -428,6 +439,16 @@ class SceneNode:
                     if tex_idx is not None:
                         # Use as metallicRoughness for now (not ideal but better than nothing)
                         tex_info['metallicRoughnessTexture'] = texture_to_image.get(tex_idx)
+            
+            # KHR_materials_specular extension
+            if mat.extensions and 'KHR_materials_specular' in mat.extensions:
+                spec_ext = mat.extensions['KHR_materials_specular']
+                if 'specularColorTexture' in spec_ext and spec_ext['specularColorTexture']:
+                    tex_idx = spec_ext['specularColorTexture'].get('index')
+                    if tex_idx is not None:
+                        tex_info['specularColorTexture'] = texture_to_image.get(tex_idx)
+                if 'specularColorFactor' in spec_ext and spec_ext['specularColorFactor'] is not None:
+                    tex_info['specularColorFactor'] = spec_ext['specularColorFactor']
             
             # Extract alpha mode and cutoff from glTF material
             if mat.alphaMode is not None:

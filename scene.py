@@ -37,6 +37,7 @@ class Scene:
     TEXTURE_FLAG_ROUGHNESS = 1 << 2
     TEXTURE_FLAG_METALLIC = 1 << 3
     TEXTURE_FLAG_EMISSIVE = 1 << 4
+    TEXTURE_FLAG_SPECULAR_COLOR = 1 << 5
     
     @dataclass
     class MaterialData:
@@ -50,12 +51,14 @@ class Scene:
         texture_flags: int
         alpha_mode: int
         alpha_cutoff: float
+        specular_color: spy.float3
         # TextureRecords for bindless handles (None means use default)
         base_color_tex: Optional[TextureRecord]
         normal_tex: Optional[TextureRecord]
         roughness_tex: Optional[TextureRecord]
         metallic_tex: Optional[TextureRecord]
         emissive_tex: Optional[TextureRecord]
+        specular_color_tex: Optional[TextureRecord]
 
     @dataclass
     class MeshDesc:
@@ -153,6 +156,7 @@ class Scene:
             roughness_tex = None
             metallic_tex = None
             emissive_tex = None
+            specular_color_tex = None
             texture_flags = 0
             
             if m.base_color_texture:
@@ -175,6 +179,10 @@ class Scene:
                 emissive_tex = self.texture_manager.load_texture(m.emissive_texture, TextureType.EMISSIVE)
                 texture_flags |= Scene.TEXTURE_FLAG_EMISSIVE
             
+            if m.specular_color_texture:
+                specular_color_tex = self.texture_manager.load_texture(m.specular_color_texture, TextureType.SPECULAR_COLOR)
+                texture_flags |= Scene.TEXTURE_FLAG_SPECULAR_COLOR
+            
             # Debug: print texture_flags for all materials
             print(f"[Scene] Material {i} (desc_idx={len(self.material_data_list)}): texture_flags={texture_flags}, "
                   f"base_color={m.base_color}, "
@@ -190,11 +198,13 @@ class Scene:
                 texture_flags=texture_flags,
                 alpha_mode=m.alpha_mode,
                 alpha_cutoff=m.alpha_cutoff,
+                specular_color=m.specular_color,
                 base_color_tex=base_color_tex,
                 normal_tex=normal_tex,
                 roughness_tex=roughness_tex,
                 metallic_tex=metallic_tex,
-                emissive_tex=emissive_tex
+                emissive_tex=emissive_tex,
+                specular_color_tex=specular_color_tex
             ))
         
         # Create material buffer using BufferCursor for proper Handle binding
@@ -493,11 +503,13 @@ class Scene:
                 texture_flags=0,
                 alpha_mode=ALPHA_MODE_OPAQUE,
                 alpha_cutoff=0.5,
+                specular_color=spy.float3(1.0, 1.0, 1.0),
                 base_color_tex=None,
                 normal_tex=None,
                 roughness_tex=None,
                 metallic_tex=None,
-                emissive_tex=None
+                emissive_tex=None,
+                specular_color_tex=None
             )]
         
         # Load the common.slang module to get MaterialDesc layout
@@ -524,6 +536,7 @@ class Scene:
         default_roughness = self.texture_manager.get_default_texture(TextureType.ROUGHNESS)
         default_metallic = self.texture_manager.get_default_texture(TextureType.METALLIC)
         default_emissive = self.texture_manager.get_default_texture(TextureType.EMISSIVE)
+        default_specular_color = self.texture_manager.get_default_texture(TextureType.SPECULAR_COLOR)
         
         # Fill buffer using BufferCursor
         cursor = spy.BufferCursor(material_desc_layout, buffer, load_before_write=False)
@@ -537,7 +550,7 @@ class Scene:
             cursor[i].texture_flags = mat.texture_flags
             cursor[i].alpha_mode = mat.alpha_mode
             cursor[i].alpha_cutoff = mat.alpha_cutoff
-            # pad0, pad1, pad2 are automatically zero
+            cursor[i].specular_color = mat.specular_color
             
             # Set texture handles using descriptor_handle_ro from TextureView
             base_tex = mat.base_color_tex if mat.base_color_tex else default_base_color
@@ -545,12 +558,14 @@ class Scene:
             rough_tex = mat.roughness_tex if mat.roughness_tex else default_roughness
             metal_tex = mat.metallic_tex if mat.metallic_tex else default_metallic
             emiss_tex = mat.emissive_tex if mat.emissive_tex else default_emissive
+            spec_color_tex = mat.specular_color_tex if mat.specular_color_tex else default_specular_color
             
             cursor[i].base_color_tex_handle = base_tex.view.descriptor_handle_ro
             cursor[i].normal_tex_handle = normal_tex.view.descriptor_handle_ro
             cursor[i].roughness_tex_handle = rough_tex.view.descriptor_handle_ro
             cursor[i].metallic_tex_handle = metal_tex.view.descriptor_handle_ro
             cursor[i].emissive_tex_handle = emiss_tex.view.descriptor_handle_ro
+            cursor[i].specular_color_tex_handle = spec_color_tex.view.descriptor_handle_ro
         
         cursor.apply()
         return buffer

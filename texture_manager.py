@@ -12,11 +12,12 @@ texture_loader_debug_print = False
 
 class TextureType(IntEnum):
     """Texture type, used to determine loading options and default values"""
-    BASE_COLOR = 0    # sRGB, default white
-    NORMAL = 1        # Linear, default (0.5, 0.5, 1.0, 1.0)
-    ROUGHNESS = 2     # Linear, default 0.5
-    METALLIC = 3      # Linear, default 0.0
-    EMISSIVE = 4      # sRGB, default black
+    BASE_COLOR = 0       # sRGB, default white
+    NORMAL = 1           # Linear, default (0.5, 0.5, 1.0, 1.0)
+    ROUGHNESS = 2        # Linear, default 0.5
+    METALLIC = 3         # Linear, default 0.0
+    EMISSIVE = 4         # sRGB, default black
+    SPECULAR_COLOR = 5   # sRGB, default white
 
 
 @dataclass
@@ -46,6 +47,7 @@ class TextureManager:
         TextureType.ROUGHNESS: [128, 128, 128, 255],     # 0.5 gray
         TextureType.METALLIC: [0, 0, 0, 255],            # black (non-metallic)
         TextureType.EMISSIVE: [0, 0, 0, 255],            # black (no emission)
+        TextureType.SPECULAR_COLOR: [255, 255, 255, 255], # white (default specular)
     }
     
     def __init__(self, device: spy.Device):
@@ -90,7 +92,7 @@ class TextureManager:
             return self._texture_cache[cache_key]
         
         # Determine whether to use sRGB
-        is_srgb = texture_type in (TextureType.BASE_COLOR, TextureType.EMISSIVE)
+        is_srgb = texture_type in (TextureType.BASE_COLOR, TextureType.EMISSIVE, TextureType.SPECULAR_COLOR)
         
         # Try alternative extensions if file doesn't exist
         actual_path = path
@@ -198,7 +200,7 @@ class TextureManager:
         """Create default textures (1x1 pixel)"""
         for tex_type in TextureType:
             color = self.DEFAULT_COLORS[tex_type]
-            is_srgb = tex_type in (TextureType.BASE_COLOR, TextureType.EMISSIVE)
+            is_srgb = tex_type in (TextureType.BASE_COLOR, TextureType.EMISSIVE, TextureType.SPECULAR_COLOR)
             
             # Create 1x1 RGBA data
             data = np.array([[color]], dtype=np.uint8)

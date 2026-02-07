@@ -25,6 +25,7 @@ class Material:
     def __init__(self, 
                  base_color: "spy.float3param" = spy.float3(0.5),
                  emissive: "spy.float3param" = spy.float3(0.0),
+                 specular_color: "spy.float3param" = spy.float3(1.0),
                  roughness: float = 0.5,
                  metallic: float = 0.0,
                  # PBR texture paths (None means use constant value)
@@ -33,6 +34,7 @@ class Material:
                  roughness_texture: Optional[str] = None,
                  metallic_texture: Optional[str] = None,
                  emissive_texture: Optional[str] = None,
+                 specular_color_texture: Optional[str] = None,
                  # Alpha related properties
                  alpha_mode: int = ALPHA_MODE_OPAQUE,
                  alpha_cutoff: float = 0.5):
@@ -40,6 +42,7 @@ class Material:
         # Constant values
         self.base_color = base_color
         self.emissive = emissive
+        self.specular_color = specular_color
         self.roughness = roughness
         self.metallic = metallic
         
@@ -49,6 +52,7 @@ class Material:
         self.roughness_texture = roughness_texture
         self.metallic_texture = metallic_texture
         self.emissive_texture = emissive_texture
+        self.specular_color_texture = specular_color_texture
         
         # Alpha related
         self.alpha_mode = alpha_mode
@@ -65,7 +69,8 @@ class Material:
             self.normal_texture,
             self.roughness_texture,
             self.metallic_texture,
-            self.emissive_texture
+            self.emissive_texture,
+            self.specular_color_texture,
         ])
 
 

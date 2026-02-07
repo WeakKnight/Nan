@@ -162,6 +162,7 @@ struct Scene {
         float3 emissive_color = material.emissive;
         float roughness_value = material.roughness;
         float metallic_value = material.metallic;
+        float3 specular_color_value = material.specular_color;
         
         if (material.has_base_color_texture())
         {
@@ -184,6 +185,11 @@ struct Scene {
         {
             // glTF: metallic is in B channel of metallicRoughness texture
             metallic_value = material.metallic_tex_handle.SampleLevel(linear_sampler, uv, 0).b;
+        }
+        
+        if (material.has_specular_color_texture())
+        {
+            specular_color_value = material.specular_color_tex_handle.SampleLevel(linear_sampler, uv, 0).rgb * material.specular_color;
         }
         
         // Normal mapping
@@ -246,7 +252,7 @@ struct Scene {
         shading_data.diffuse = diffuse_color;
         shading_data.emissive = emissive_color;
         shading_data.roughness = roughness_value;
-        shading_data.specular = 0.04 * (1.0 - metallic_value);  // Default dielectric F0
+        shading_data.specular = 0.04 * (1.0 - metallic_value) * specular_color_value;  // Dielectric F0 * specular color
         return shading_data;
     }
 
