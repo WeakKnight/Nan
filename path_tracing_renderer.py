@@ -79,3 +79,7 @@ class PathTracingRenderer:
 
     def setup_ui(self, ui_context: spy.ui.Context, ui_window: spy.ui.Window):
         self.use_accum_check_box = spy.ui.CheckBox(ui_window, 'Use Accum')
+        
+        def on_exposure_changed(value):
+            self.tone_mapper.exposure = value
+        spy.ui.SliderFloat(ui_window, 'Exposure', min=-4.0, max=4.0, value=1.0, callback=on_exposure_changed)

@@ -5,6 +5,7 @@ class ToneMapper:
         self.device = device
         self.program = self.device.load_program("tone_mapper.slang", ["compute_main"])
         self.kernel = self.device.create_compute_kernel(self.program)
+        self.exposure = 1.0
 
     def execute(
         self,
@@ -18,6 +19,7 @@ class ToneMapper:
                 "g_tone_mapper": {
                     "input": input,
                     "output": output,
+                    "exposure": self.exposure,
                 }
             },
             command_encoder=command_encoder,
