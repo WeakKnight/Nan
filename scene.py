@@ -604,7 +604,7 @@ class Scene:
         """Setup scene-related UI elements."""
         now = datetime.now()
         current_hours = now.hour + now.minute / 60.0 + now.second / 3600.0
-        self._hours_slider = spy.ui.SliderFloat(ui_window, 'Hours', min=0, max=24, value=current_hours)
+        self._hours_slider = spy.ui.SliderFloat(ui_window, 'Hours', min=0, max=23.99, value=current_hours)
         # Directional light intensity slider (0 to 20, default: PI)
         self._intensity_slider = spy.ui.SliderFloat(ui_window, 'Sun Intensity', min=0, max=20, value=self._directional_light_intensity)
         # Initialize sun position with current time
