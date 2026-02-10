@@ -1,0 +1,10 @@
+[submodule "External/MathLib"]
+	path = External/MathLib
+	url = https://github.com/NVIDIA-RTX/MathLib.git
+	branch = main
+	update = merge
+[submodule "External/NRI"]
+	path = External/NRI
+	url = https://github.com/NVIDIA-RTX/NRI.git
+	branch = main
+	update = merge

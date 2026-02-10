@@ -1,0 +1,164 @@
+// © 2022 NVIDIA Corporation
+
+#include "Include/Shared.hlsli"
+
+// Inputs
+NRI_RESOURCE( Texture2D<float>, gIn_ViewZ, t, 0, SET_OTHER );
+NRI_RESOURCE( Texture2D<float4>, gIn_Normal_Roughness, t, 1, SET_OTHER );
+NRI_RESOURCE( Texture2D<float4>, gIn_BaseColor_Metalness, t, 2, SET_OTHER );
+NRI_RESOURCE( Texture2D<float3>, gIn_DirectLighting, t, 3, SET_OTHER );
+NRI_RESOURCE( Texture2D<float3>, gIn_DirectEmission, t, 4, SET_OTHER );
+NRI_RESOURCE( Texture2D<float3>, gIn_PsrThroughput, t, 5, SET_OTHER );
+NRI_RESOURCE( Texture2D<float4>, gIn_Shadow, t, 6, SET_OTHER );
+NRI_RESOURCE( Texture2D<float4>, gIn_Diff, t, 7, SET_OTHER );
+NRI_RESOURCE( Texture2D<float4>, gIn_Spec, t, 8, SET_OTHER );
+#if( NRD_MODE == SH )
+    NRI_RESOURCE( Texture2D<float4>, gIn_DiffSh, t, 9, SET_OTHER );
+    NRI_RESOURCE( Texture2D<float4>, gIn_SpecSh, t, 10, SET_OTHER );
+#endif
+
+// Outputs
+NRI_FORMAT("unknown") NRI_RESOURCE( RWTexture2D<float3>, gOut_ComposedDiff, u, 0, SET_OTHER );
+NRI_FORMAT("unknown") NRI_RESOURCE( RWTexture2D<float4>, gOut_ComposedSpec_ViewZ, u, 1, SET_OTHER );
+
+[numthreads( 16, 16, 1 )]
+void main( int2 pixelPos : SV_DispatchThreadId )
+{
+    float2 pixelUv = float2( pixelPos + 0.5 ) * gInvRectSize;
+
+    // Do not generate NANs for unused threads
+    if( pixelUv.x > 1.0 || pixelUv.y > 1.0 )
+        return;
+
+    // ViewZ
+    float viewZ = gIn_ViewZ[ pixelPos ];
+    float3 Lemi = gIn_DirectEmission[ pixelPos ];
+
+    // Normal, roughness and material ID
+    float materialID;
+    float4 normalAndRoughness = NRD_FrontEnd_UnpackNormalAndRoughness( gIn_Normal_Roughness[ pixelPos ], materialID );
+    float3 N = normalAndRoughness.xyz;
+    float roughness = normalAndRoughness.w;
+
+    // ( Trick ) Needed only to avoid back facing in "ReprojectIrradiance"
+    float z = abs( viewZ ) * FP16_VIEWZ_SCALE;
+    z *= Math::Sign( dot( N, gSunDirection.xyz ) );
+
+    // Early out - sky
+    if( abs( viewZ ) >= INF )
+    {
+        gOut_ComposedDiff[ pixelPos ] = Lemi;
+        gOut_ComposedSpec_ViewZ[ pixelPos ] = float4( 0, 0, 0, z );
+
+        return;
+    }
+
+    // Direct sun lighting * shadow + emission
+    float4 shadowData = gIn_Shadow[ pixelPos ];
+
+    #if( SIGMA_TRANSLUCENCY == 1 )
+        float3 shadow = SIGMA_BackEnd_UnpackShadow( shadowData ).yzw;
+    #else
+        float shadow = SIGMA_BackEnd_UnpackShadow( shadowData ).x;
+    #endif
+
+    float3 Ldirect = gIn_DirectLighting[ pixelPos ];
+    Ldirect = Ldirect * shadow + Lemi;
+
+    // G-buffer
+    float3 albedo, Rf0;
+    float4 baseColorMetalness = gIn_BaseColor_Metalness[ pixelPos ];
+    BRDF::ConvertBaseColorMetalnessToAlbedoRf0( baseColorMetalness.xyz, baseColorMetalness.w, albedo, Rf0 );
+
+    float3 Xv = Geometry::ReconstructViewPosition( pixelUv, gCameraFrustum, viewZ, gOrthoMode );
+    float3 V = gOrthoMode == 0 ? normalize( Geometry::RotateVector( gViewToWorld, 0 - Xv ) ) : gViewDirection.xyz;
+
+    // Sample NRD outputs
+    float4 diff = gIn_Diff[ pixelPos ];
+    float4 spec = gIn_Spec[ pixelPos ];
+
+    #if( NRD_MODE == SH )
+        float4 diff1 = gIn_DiffSh[ pixelPos ];
+        float4 spec1 = gIn_SpecSh[ pixelPos ];
+    #endif
+
+    // Decode SH mode outputs
+    #if( NRD_MODE == SH )
+        NRD_SG diffSg = REBLUR_BackEnd_UnpackSh( diff, diff1 );
+        NRD_SG specSg = REBLUR_BackEnd_UnpackSh( spec, spec1 );
+
+        if( gDenoiserType == DENOISER_RELAX )
+        {
+            diffSg = RELAX_BackEnd_UnpackSh( diff, diff1 );
+            specSg = RELAX_BackEnd_UnpackSh( spec, spec1 );
+        }
+
+        // Regain macro-details
+        diff.xyz = NRD_SG_ResolveDiffuse( diffSg, N, V, roughness ); // or NRD_SH_ResolveDiffuse( diffSg, N )
+        spec.xyz = NRD_SG_ResolveSpecular( specSg, N, V, roughness );
+
+        // Regain micro-details & jittering // TODO: preload N and Z into SMEM
+        float3 Ne = NRD_FrontEnd_UnpackNormalAndRoughness( gIn_Normal_Roughness[ pixelPos + int2(  1,  0 ) ] ).xyz;
+        float3 Nw = NRD_FrontEnd_UnpackNormalAndRoughness( gIn_Normal_Roughness[ pixelPos + int2( -1,  0 ) ] ).xyz;
+        float3 Nn = NRD_FrontEnd_UnpackNormalAndRoughness( gIn_Normal_Roughness[ pixelPos + int2(  0,  1 ) ] ).xyz;
+        float3 Ns = NRD_FrontEnd_UnpackNormalAndRoughness( gIn_Normal_Roughness[ pixelPos + int2(  0, -1 ) ] ).xyz;
+
+        float Ze = gIn_ViewZ[ pixelPos + int2(  1,  0 ) ];
+        float Zw = gIn_ViewZ[ pixelPos + int2( -1,  0 ) ];
+        float Zn = gIn_ViewZ[ pixelPos + int2(  0,  1 ) ];
+        float Zs = gIn_ViewZ[ pixelPos + int2(  0, -1 ) ];
+
+        float2 scale = NRD_SG_ReJitter( diffSg, specSg, V, roughness, viewZ, Ze, Zw, Zn, Zs, N, Ne, Nw, Nn, Ns );
+
+        diff.xyz *= scale.x;
+        spec.xyz *= scale.y;
+
+        // ( Optional ) Unresolved
+        if( !gResolve || pixelUv.x < gSeparator )
+        {
+            diff.xyz = NRD_SG_ExtractColor( diffSg );
+            spec.xyz = NRD_SG_ExtractColor( specSg );
+        }
+
+    // Decode NORMAL mode outputs
+    #else
+        if( gDenoiserType == DENOISER_RELAX )
+        {
+            diff = RELAX_BackEnd_UnpackRadiance( diff );
+            spec = RELAX_BackEnd_UnpackRadiance( spec );
+        }
+        else
+        {
+            diff = REBLUR_BackEnd_UnpackRadianceAndNormHitDist( diff );
+            spec = REBLUR_BackEnd_UnpackRadianceAndNormHitDist( spec );
+        }
+    #endif
+
+    // Material modulation ( convert radiance back into irradiance )
+    float3 diffFactor, specFactor;
+    NRD_MaterialFactors( N, V, albedo, Rf0, roughness, diffFactor, specFactor );
+
+    // We can combine radiance ( for everything ) and irradiance ( for hair ) in denoising if material ID test is enabled
+    if( materialID == MATERIAL_ID_HAIR )
+    {
+        diffFactor = 1.0;
+        specFactor = 1.0;
+    }
+
+    // Composition
+    float3 Ldiff = diff.xyz * diffFactor;
+    float3 Lspec = spec.xyz * specFactor;
+
+    // Apply PSR throughput ( primary surface material before replacement )
+    float3 psrThroughput = gIn_PsrThroughput[ pixelPos ];
+    Ldiff *= psrThroughput;
+    Lspec *= psrThroughput;
+    Ldirect *= psrThroughput;
+
+    // IMPORTANT: we store diffuse and specular separately to be able to use the reprojection trick. Let's assume that direct lighting can always be reprojected as diffuse
+    Ldiff += Ldirect;
+
+    // Output
+    gOut_ComposedDiff[ pixelPos ] = Ldiff;
+    gOut_ComposedSpec_ViewZ[ pixelPos ] = float4( Lspec, z );
+}
