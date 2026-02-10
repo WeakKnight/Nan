@@ -9,7 +9,8 @@ class PathTracer:
         self.program = self.device.load_program("path_tracer.slang", ["compute_main"])
         self.pipeline = self.device.create_compute_pipeline(self.program)
 
-    def execute(self, command_encoder: spy.CommandEncoder, output: spy.Texture, frame: int):
+    def execute(self, command_encoder: spy.CommandEncoder, output: spy.Texture, frame: int,
+                motion: spy.Texture | None = None, viewz: spy.Texture | None = None):
         w = output.width
         h = output.height
 
@@ -18,5 +19,9 @@ class PathTracer:
             cursor = spy.ShaderCursor(shader_object)
             cursor.g_output = output
             cursor.g_frame = frame
+            if motion is not None:
+                cursor.g_motion = motion
+            if viewz is not None:
+                cursor.g_viewz = viewz
             self.scene.bind(cursor.g_scene)
             pass_encoder.dispatch(thread_count=[w, h, 1])

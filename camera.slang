@@ -9,6 +9,7 @@ struct Camera {
     float4x4 view_proj_matrix_no_jitter;
     float4x4 prev_view_proj_matrix;
     float4x4 prev_view_proj_matrix_no_jitter;
+    float4x4 prev_view_matrix;
 
     float3 position;
     float jitter_x;

@@ -45,6 +45,7 @@ class Camera:
     def recompute(self):
         previous_view_proj_matrix_no_jitter = getattr(self, "view_proj_matrix_no_jitter", None) if self._has_prev_matrices else None
         previous_view_proj_matrix = getattr(self, "view_proj_matrix", None) if self._has_prev_matrices else None
+        previous_view_matrix = getattr(self, "view_matrix", None) if self._has_prev_matrices else None
 
         self.aspect_ratio = float(self.width) / float(self.height)
 
@@ -82,6 +83,10 @@ class Camera:
             self.prev_view_proj_matrix = self.view_proj_matrix
         else:
             self.prev_view_proj_matrix = previous_view_proj_matrix
+        if previous_view_matrix is None:
+            self.prev_view_matrix = self.view_matrix
+        else:
+            self.prev_view_matrix = previous_view_matrix
         self._has_prev_matrices = True
 
     def begin_frame(self, w, h):
@@ -104,6 +109,7 @@ class Camera:
         cursor["view_proj_matrix_no_jitter"] = self.view_proj_matrix_no_jitter
         cursor["prev_view_proj_matrix"] = self.prev_view_proj_matrix
         cursor["prev_view_proj_matrix_no_jitter"] = self.prev_view_proj_matrix_no_jitter
+        cursor["prev_view_matrix"] = self.prev_view_matrix
 
         cursor["position"] = self.position
         cursor["image_u"] = self.image_u
@@ -184,7 +190,11 @@ class CameraController:
             self.camera.position = position
             self.camera.target = position + fwd
             self.camera.up = spy.float3(0, 1, 0)
-            self.camera.recompute()
+            # NOTE: Do NOT call recompute() here.
+            # begin_frame() will call recompute() which correctly saves
+            # the previous frame's matrices before computing the new ones.
+            # A double recompute() would overwrite prev matrices with
+            # current-frame values, making motion vectors ≈ 0.
 
         return changed
 

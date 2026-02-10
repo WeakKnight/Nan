@@ -432,6 +432,44 @@ struct Scene {
         return clip.z / clip.w;
     }
 
+    // Project world position to [0,1] screen UV.
+    // Uses the same NDC-to-UV convention as compute_non_normalized_ray_dir_pinhole (DX style, Y-down).
+    float2 world_to_screen_uv(float4x4 world_to_clip, float3 X)
+    {
+        float4 clip = mul(world_to_clip, float4(X, 1.0));
+        float2 ndc = clip.xy / clip.w;
+        return ndc * float2(0.5, -0.5) + 0.5;
+    }
+
+    // Compute 2.5D motion vector following NRD convention.
+    // Reference: NRDSample Shared.hlsli GetMotion()
+    //
+    // For static geometry, pass Xprev = X.
+    // Uses no-jitter matrices for clean camera-only motion.
+    //
+    // Returns:
+    //   .xy = screen-space motion in pixel units: (prevUV - currUV) * rect_size
+    //   .z  = linear view-space depth delta: prevViewZ - currViewZ
+    float3 get_motion(float3 X, float3 Xprev, float2 rect_size)
+    {
+        // Linear view-space depth (view_matrix * worldPos).z
+        float viewZ = mul(camera.view_matrix, float4(X, 1.0)).z;
+        float viewZprev = mul(camera.prev_view_matrix, float4(Xprev, 1.0)).z;
+
+        // Screen UV (no jitter for stable motion)
+        float2 uv = world_to_screen_uv(camera.view_proj_matrix_no_jitter, X);
+        float2 uvPrev = world_to_screen_uv(camera.prev_view_proj_matrix_no_jitter, Xprev);
+
+        // IMPORTANT: scaling to pixel units improves FP16 utilisation (NRD convention)
+        float3 motion;
+        motion.xy = (uvPrev - uv) * rect_size;
+
+        // IMPORTANT: 2.5D motion preferred over 3D (NRD convention)
+        motion.z = viewZprev - viewZ;
+
+        return motion;
+    }
+
     HitInfo intersect(Ray ray)
     {
         HitInfo hit = {};

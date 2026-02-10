@@ -24,6 +24,8 @@ struct Path {
 };
 
 RWTexture2D<float4> g_output;
+RWTexture2D<float4> g_motion;   // .xy = motion in pixels, .z = viewZ delta, .w = viewZ (before PSR)
+RWTexture2D<float>  g_viewz;    // linear view-space Z (sign * INF for miss)
 uniform uint g_frame;
 
 void trace_path(inout Path path)
@@ -97,6 +99,32 @@ void compute_main(uint3 tid: SV_DispatchThreadID)
     return;
 #endif
 
+    // Primary ray for G-buffer (motion + viewZ)
+    {
+        Ray primary_ray = g_scene.camera.compute_ray_pinhole(pixel, dim, false); // no jitter for G-buffer
+        HitInfo primary_hit = g_scene.intersect(primary_ray);
+
+        if (primary_hit.valid)
+        {
+            Vertex v = g_scene.get_vertex(primary_hit);
+            float3 X = v.position;
+            // Static geometry: Xprev == X
+            float3 motion = g_scene.get_motion(X, X, float2(dim));
+            float viewZ = mul(g_scene.camera.view_matrix, float4(X, 1.0)).z;
+            g_motion[pixel] = float4(motion, viewZ);
+            g_viewz[pixel] = viewZ;
+        }
+        else
+        {
+            // Miss: compute a large viewZ along the ray direction
+            float viewZ_sign = sign(mul(g_scene.camera.view_matrix, float4(primary_ray.dir, 0.0)).z);
+            float viewZ = viewZ_sign * 1e30;
+            g_motion[pixel] = float4(0, 0, 0, viewZ);
+            g_viewz[pixel] = viewZ;
+        }
+    }
+
+    // Path trace for color
     const uint spp = 1;
     float3 L = float3(0);
     for (uint i = 0; i < spp; i++) {
