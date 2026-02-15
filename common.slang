@@ -356,7 +356,7 @@ struct ShadingData
     float3 face_normal;     // Already flipped toward viewer for double-sided materials
     float3 diffuse;
     float3 specular;
-    float3 roughness;
+    float roughness;
     float3 emissive;
     bool front_facing;      // Original geometric orientation (for IOR in refraction)
     bool double_sided;

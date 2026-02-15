@@ -1,5 +1,6 @@
 import common;
 import camera;
+import software_rt;
 
 ParameterBlock<Scene> g_scene;
 
@@ -28,14 +29,27 @@ float safeacos(float x) {
 }
 
 struct Scene {
-    RaytracingAccelerationStructure tlas;
+    // Software RT BVH buffers (replaces hardware RaytracingAccelerationStructure)
+    StructuredBuffer<uint> tlas_nodes;           // raw uint buffer, 8 uints per BVH node
+    StructuredBuffer<uint> tlas_instance_order;
+    StructuredBuffer<uint> blas_nodes;           // raw uint buffer, 8 uints per BVH node
+    StructuredBuffer<uint> blas_offsets;
+    StructuredBuffer<uint> blas_prim_indices;
+    StructuredBuffer<uint> blas_prim_offsets;
+    StructuredBuffer<float4x4> inverse_transforms;  // for ray transform to object space
 
     StructuredBuffer<MaterialDesc> material_descs;
+    StructuredBuffer<float> raw_material_descs;    // 16 floats per MaterialDesc (avoids struct padding)
     
     StructuredBuffer<MeshDesc> mesh_descs;
     StructuredBuffer<InstanceDesc> instance_descs;
     StructuredBuffer<Vertex> vertices;
     StructuredBuffer<uint> indices;
+
+    // Raw buffer views for software RT (avoids struct padding issues on Metal)
+    StructuredBuffer<float> raw_vertices;         // 8 floats per vertex
+    StructuredBuffer<uint> raw_mesh_descs;         // 4 uints per MeshDesc
+    StructuredBuffer<uint> raw_instance_descs;     // 4 uints per InstanceDesc
 
     StructuredBuffer<float4x4> transforms;
     StructuredBuffer<float4x4> inverse_transpose_transforms;
@@ -56,17 +70,43 @@ struct Scene {
     uint pad1;
     uint pad2;
 
-    // Load MaterialDesc directly from StructuredBuffer
+    // Load MaterialDesc directly from StructuredBuffer (for texture handles)
     MaterialDesc load_material_desc(uint index)
     {
         return material_descs[index];
     }
 
+    // Load basic material data from raw float buffer, patching over struct-loaded MaterialDesc
+    // This avoids struct padding issues on Metal for the scalar/vector fields
+    // Raw layout: 16 floats per material
+    // [0-2] base_color, [3] flags(uint), [4-6] emissive, [7] shading_model(uint),
+    // [8] roughness, [9] metallic, [10] texture_flags(uint), [11] alpha_mode(uint),
+    // [12] alpha_cutoff, [13-15] specular_color
+    MaterialDesc load_material_desc_safe(uint index)
+    {
+        MaterialDesc mat = material_descs[index];  // get texture handles from struct buffer
+        // Override scalar/vector fields from raw buffer to avoid padding issues
+        uint base = index * 16;
+        mat.base_color = float3(raw_material_descs[base + 0], raw_material_descs[base + 1], raw_material_descs[base + 2]);
+        mat.flags = asuint(raw_material_descs[base + 3]);
+        mat.emissive = float3(raw_material_descs[base + 4], raw_material_descs[base + 5], raw_material_descs[base + 6]);
+        mat.shading_model = asuint(raw_material_descs[base + 7]);
+        mat.roughness = raw_material_descs[base + 8];
+        mat.metallic = raw_material_descs[base + 9];
+        mat.texture_flags = asuint(raw_material_descs[base + 10]);
+        mat.alpha_mode = asuint(raw_material_descs[base + 11]);
+        mat.alpha_cutoff = raw_material_descs[base + 12];
+        mat.specular_color = float3(raw_material_descs[base + 13], raw_material_descs[base + 14], raw_material_descs[base + 15]);
+        return mat;
+    }
+
 
     MaterialDesc get_material(HitInfo hit_info)
     {
-        InstanceDesc instance_desc = g_scene.instance_descs[hit_info.instance_id];
-        return load_material_desc(instance_desc.material_id);
+        // Use raw buffer to avoid struct padding issues on Metal
+        uint inst_base = hit_info.instance_id * 4;
+        uint material_id = raw_instance_descs[inst_base + 1];
+        return load_material_desc_safe(material_id);
     }
 
     // Get opacity from material at given UV (samples base_color_texture alpha channel if available)
@@ -96,6 +136,37 @@ struct Scene {
         return opacity >= sample_uniform_rng(rng);
     }
 
+    // Helper: read InstanceDesc from raw buffer (4 uints per instance)
+    void load_raw_instance(uint instance_id, out uint mesh_id, out uint material_id, out uint transform_id, out uint instance_flags)
+    {
+        uint base = instance_id * 4;
+        mesh_id = raw_instance_descs[base + 0];
+        material_id = raw_instance_descs[base + 1];
+        transform_id = raw_instance_descs[base + 2];
+        instance_flags = raw_instance_descs[base + 3];
+    }
+
+    // Helper: read MeshDesc from raw buffer (4 uints per mesh)
+    void load_raw_mesh(uint mesh_id, out uint vertex_count, out uint index_count, out uint vertex_offset, out uint index_offset)
+    {
+        uint base = mesh_id * 4;
+        vertex_count = raw_mesh_descs[base + 0];
+        index_count = raw_mesh_descs[base + 1];
+        vertex_offset = raw_mesh_descs[base + 2];
+        index_offset = raw_mesh_descs[base + 3];
+    }
+
+    // Helper: read Vertex from raw float buffer (8 floats per vertex: pos.xyz, normal.xyz, uv.xy)
+    Vertex load_raw_vertex(uint vertex_index)
+    {
+        uint base = vertex_index * 8;
+        Vertex v;
+        v.position = float3(raw_vertices[base + 0], raw_vertices[base + 1], raw_vertices[base + 2]);
+        v.normal   = float3(raw_vertices[base + 3], raw_vertices[base + 4], raw_vertices[base + 5]);
+        v.uv       = float2(raw_vertices[base + 6], raw_vertices[base + 7]);
+        return v;
+    }
+
     Vertex get_vertex(HitInfo hit_info)
     {
         return get_vertex(hit_info.instance_id, hit_info.primitive_index, hit_info.bary);
@@ -103,16 +174,21 @@ struct Scene {
 
     Vertex get_vertex(uint instance_id, uint primitive_index, float2 bary)
     {
-        InstanceDesc instance_desc = g_scene.instance_descs[instance_id];
-        MeshDesc mesh_desc = g_scene.mesh_descs[instance_desc.mesh_id];
-        float4x4 transform = g_scene.transforms[instance_desc.transform_id];
-        float4x4 inverse_transpose_transform = g_scene.inverse_transpose_transforms[instance_desc.transform_id];
-        uint i0 = g_scene.indices[mesh_desc.index_offset + primitive_index * 3 + 0];
-        uint i1 = g_scene.indices[mesh_desc.index_offset + primitive_index * 3 + 1];
-        uint i2 = g_scene.indices[mesh_desc.index_offset + primitive_index * 3 + 2];
-        Vertex v0 = g_scene.vertices[mesh_desc.vertex_offset + i0];
-        Vertex v1 = g_scene.vertices[mesh_desc.vertex_offset + i1];
-        Vertex v2 = g_scene.vertices[mesh_desc.vertex_offset + i2];
+        // Use raw buffers to avoid struct padding issues on Metal
+        uint mesh_id, material_id, transform_id, instance_flags;
+        load_raw_instance(instance_id, mesh_id, material_id, transform_id, instance_flags);
+        
+        uint vertex_count, index_count, vertex_offset, index_offset;
+        load_raw_mesh(mesh_id, vertex_count, index_count, vertex_offset, index_offset);
+        
+        float4x4 transform = g_scene.transforms[transform_id];
+        float4x4 inverse_transpose_transform = g_scene.inverse_transpose_transforms[transform_id];
+        uint i0 = g_scene.indices[index_offset + primitive_index * 3 + 0];
+        uint i1 = g_scene.indices[index_offset + primitive_index * 3 + 1];
+        uint i2 = g_scene.indices[index_offset + primitive_index * 3 + 2];
+        Vertex v0 = load_raw_vertex(vertex_offset + i0);
+        Vertex v1 = load_raw_vertex(vertex_offset + i1);
+        Vertex v2 = load_raw_vertex(vertex_offset + i2);
         float3 b = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
         return {
             mul(transform, float4(b.x * v0.position + b.y * v1.position + b.z * v2.position, 1.0)).xyz,
@@ -129,16 +205,21 @@ struct Scene {
         uint primitive_index = hit_info.primitive_index;
         float2 bary = hit_info.bary;
 
-        InstanceDesc instance_desc = g_scene.instance_descs[instance_id];
-        MeshDesc mesh_desc = g_scene.mesh_descs[instance_desc.mesh_id];
-        float4x4 transform = g_scene.transforms[instance_desc.transform_id];
-        float4x4 inverse_transpose_transform = g_scene.inverse_transpose_transforms[instance_desc.transform_id];
-        uint i0 = g_scene.indices[mesh_desc.index_offset + primitive_index * 3 + 0];
-        uint i1 = g_scene.indices[mesh_desc.index_offset + primitive_index * 3 + 1];
-        uint i2 = g_scene.indices[mesh_desc.index_offset + primitive_index * 3 + 2];
-        Vertex v0 = g_scene.vertices[mesh_desc.vertex_offset + i0];
-        Vertex v1 = g_scene.vertices[mesh_desc.vertex_offset + i1];
-        Vertex v2 = g_scene.vertices[mesh_desc.vertex_offset + i2];
+        // Use raw buffers to avoid struct padding issues on Metal
+        uint mesh_id, material_id_unused, transform_id, instance_flags;
+        load_raw_instance(instance_id, mesh_id, material_id_unused, transform_id, instance_flags);
+        
+        uint vertex_count, index_count, vertex_offset, index_offset;
+        load_raw_mesh(mesh_id, vertex_count, index_count, vertex_offset, index_offset);
+        
+        float4x4 transform = g_scene.transforms[transform_id];
+        float4x4 inverse_transpose_transform = g_scene.inverse_transpose_transforms[transform_id];
+        uint i0 = g_scene.indices[index_offset + primitive_index * 3 + 0];
+        uint i1 = g_scene.indices[index_offset + primitive_index * 3 + 1];
+        uint i2 = g_scene.indices[index_offset + primitive_index * 3 + 2];
+        Vertex v0 = load_raw_vertex(vertex_offset + i0);
+        Vertex v1 = load_raw_vertex(vertex_offset + i1);
+        Vertex v2 = load_raw_vertex(vertex_offset + i2);
         float3 b = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
 
         float3 position = mul(transform, float4(b.x * v0.position + b.y * v1.position + b.z * v2.position, 1.0)).xyz;
@@ -432,55 +513,43 @@ struct Scene {
         return clip.z / clip.w;
     }
 
+    // Helper to build SWRTSceneBuffers from Scene fields
+    SWRTSceneBuffers _build_swrt_scene()
+    {
+        SWRTSceneBuffers s;
+        s.tlas_nodes = tlas_nodes;
+        s.tlas_instance_order = tlas_instance_order;
+        s.blas_nodes = blas_nodes;
+        s.blas_offsets = blas_offsets;
+        s.blas_prim_indices = blas_prim_indices;
+        s.blas_prim_offsets = blas_prim_offsets;
+        s.raw_vertices = raw_vertices;
+        s.indices = indices;
+        s.raw_mesh_descs = raw_mesh_descs;
+        s.raw_instance_descs = raw_instance_descs;
+        s.transforms = transforms;
+        s.inverse_transforms = inverse_transforms;
+        s.instance_count = instance_count;
+        return s;
+    }
+
     HitInfo intersect(Ray ray)
     {
         HitInfo hit = {};
 
-        RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-        q.TraceRayInline(g_scene.tlas, 0, 0xff, ray.to_ray_desc());
-        while (q.Proceed())
+        SWRTSceneBuffers swrt_scene = _build_swrt_scene();
+
+        SWRT_RayQuery rq;
+        swrt_trace_ray_inline(rq, ray.origin, ray.dir, ray.t_min, ray.t_max);
+        swrt_proceed(rq, swrt_scene);
+
+        if (swrt_committed_status(rq) == SWRT_COMMITTED_TRIANGLE_HIT)
         {
-            if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
-            {
-                // Get candidate hit info
-                uint instance_id = q.CandidateInstanceIndex();
-                uint primitive_index = q.CandidatePrimitiveIndex();
-                float2 bary = q.CandidateTriangleBarycentrics();
-                
-                // Get material and vertex for alpha test
-                InstanceDesc instance_desc = g_scene.instance_descs[instance_id];
-                MaterialDesc material = load_material_desc(instance_desc.material_id);
-                
-                // Skip alpha test for opaque materials
-                if (material.alpha_mode == ALPHA_MODE_OPAQUE)
-                {
-                    q.CommitNonOpaqueTriangleHit();
-                    continue;
-                }
-                
-                // Get UV coordinates for texture sampling
-                Vertex v = get_vertex(instance_id, primitive_index, bary);
-                float2 uv = v.uv;
-                
-                // Get world position for stochastic alpha
-                float3 world_pos = v.position;
-                
-                // Sample opacity from texture
-                float opacity = get_opacity(material, uv);
-                
-                // Evaluate alpha test
-                if (eval_alpha_test(material, opacity, world_pos, frame_index))
-                {
-                    q.CommitNonOpaqueTriangleHit();
-                }
-            }
-        }
-        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
             hit = {
                 true,
-                q.CommittedTriangleBarycentrics(),
-                q.CommittedInstanceIndex(),
-                q.CommittedPrimitiveIndex(),
+                swrt_committed_triangle_barycentrics(rq),
+                swrt_committed_instance_index(rq),
+                swrt_committed_primitive_index(rq),
             };
         }
         return hit;
@@ -490,102 +559,28 @@ struct Scene {
     {
         HitInfo hit = {};
 
-        RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-        q.TraceRayInline(g_scene.tlas, 0, 0xff, ray.to_ray_desc());
-        while (q.Proceed())
+        SWRTSceneBuffers swrt_scene = _build_swrt_scene();
+
+        SWRT_RayQuery rq;
+        swrt_trace_ray_inline(rq, ray.origin, ray.dir, ray.t_min, ray.t_max);
+        swrt_proceed(rq, swrt_scene);
+
+        if (swrt_committed_status(rq) == SWRT_COMMITTED_TRIANGLE_HIT)
         {
-            if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
-            {
-                // Get candidate hit info
-                uint instance_id = q.CandidateInstanceIndex();
-                uint primitive_index = q.CandidatePrimitiveIndex();
-                float2 bary = q.CandidateTriangleBarycentrics();
-                
-                // Get material and vertex for alpha test
-                InstanceDesc instance_desc = g_scene.instance_descs[instance_id];
-                MaterialDesc material = load_material_desc(instance_desc.material_id);
-                
-                // Skip alpha test for opaque materials
-                if (material.alpha_mode == ALPHA_MODE_OPAQUE)
-                {
-                    q.CommitNonOpaqueTriangleHit();
-                    continue;
-                }
-                
-                // Get UV coordinates for texture sampling
-                Vertex v = get_vertex(instance_id, primitive_index, bary);
-                float2 uv = v.uv;
-                
-                // Get world position for stochastic alpha
-                float3 world_pos = v.position;
-                
-                // Sample opacity from texture
-                float opacity = get_opacity(material, uv);
-                
-                // Evaluate alpha test
-                if (eval_alpha_test(material, opacity, world_pos, frame_index))
-                {
-                    q.CommitNonOpaqueTriangleHit();
-                }
-            }
-        }
-        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
             hit = {
                 true,
-                q.CommittedTriangleBarycentrics(),
-                q.CommittedInstanceIndex(),
-                q.CommittedPrimitiveIndex(),
+                swrt_committed_triangle_barycentrics(rq),
+                swrt_committed_instance_index(rq),
+                swrt_committed_primitive_index(rq),
             };
-            t = q.CommittedRayT();
+            t = swrt_committed_ray_t(rq);
         }
         return hit;
     }
 
     float get_visibility(Ray ray)
     {
-        RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> rayQuery;
-
-        rayQuery.TraceRayInline(g_scene.tlas, RAY_FLAG_NONE, 0xff, ray.to_ray_desc());
-
-        while (rayQuery.Proceed())
-        {
-            if (rayQuery.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
-            {
-                // Get candidate hit info
-                uint instance_id = rayQuery.CandidateInstanceIndex();
-                uint primitive_index = rayQuery.CandidatePrimitiveIndex();
-                float2 bary = rayQuery.CandidateTriangleBarycentrics();
-                
-                // Get material for alpha test
-                InstanceDesc instance_desc = g_scene.instance_descs[instance_id];
-                MaterialDesc material = load_material_desc(instance_desc.material_id);
-                
-                // Opaque materials block visibility
-                if (material.alpha_mode == ALPHA_MODE_OPAQUE)
-                {
-                    rayQuery.CommitNonOpaqueTriangleHit();
-                    continue;
-                }
-                
-                // Get UV coordinates for texture sampling
-                Vertex v = get_vertex(instance_id, primitive_index, bary);
-                float2 uv = v.uv;
-                
-                // Get world position for stochastic alpha
-                float3 world_pos = v.position;
-                
-                // Sample opacity from texture
-                float opacity = get_opacity(material, uv);
-                
-                // Evaluate alpha test - if passed, ray is blocked
-                if (eval_alpha_test(material, opacity, world_pos, frame_index))
-                {
-                    rayQuery.CommitNonOpaqueTriangleHit();
-                }
-            }
-        }
-
-        bool visible = (rayQuery.CommittedStatus() == COMMITTED_NOTHING);
-        return visible ? 1.0 : 0.0;
+        SWRTSceneBuffers swrt_scene = _build_swrt_scene();
+        return swrt_get_visibility(ray.origin, ray.dir, ray.t_min, ray.t_max, swrt_scene);
     }
 };

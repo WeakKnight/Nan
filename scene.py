@@ -23,6 +23,7 @@ from event_dispatcher import SyncEventDispatcher
 from atmosphere import AtmosphereTransmittanceLUT, AtmosphereMultiScatteringLUT, AtmosphereSkyViewLUT
 from sun_position import SunPosition, SunPositionData
 from texture_manager import TextureManager, TextureType, TextureRecord
+from bvh_builder import BVHBuilder, build_blas_for_mesh, build_tlas_for_instances, compute_mesh_world_aabb, AABB
 
 
 class Scene:
@@ -209,6 +210,39 @@ class Scene:
         
         # Create material buffer using BufferCursor for proper Handle binding
         self.material_descs_buffer = self._create_material_buffer(device, self.material_data_list)
+        
+        # Create raw material buffer (avoids struct padding issues on Metal)
+        # Layout: 16 floats per material (float/uint packed as float via view_as)
+        # [0-2] base_color.xyz, [3] flags(uint), [4-6] emissive.xyz, [7] shading_model(uint),
+        # [8] roughness, [9] metallic, [10] texture_flags(uint), [11] alpha_mode(uint),
+        # [12] alpha_cutoff, [13-15] specular_color.xyz
+        raw_mat_list = []
+        for mat in self.material_data_list:
+            raw_mat_list.extend([
+                float(mat.base_color[0]), float(mat.base_color[1]), float(mat.base_color[2]),
+                0.0,  # placeholder for flags (uint)
+                float(mat.emissive[0]), float(mat.emissive[1]), float(mat.emissive[2]),
+                0.0,  # placeholder for shading_model (uint)
+                float(mat.roughness),
+                float(mat.metallic),
+                0.0,  # placeholder for texture_flags (uint)
+                0.0,  # placeholder for alpha_mode (uint)
+                float(mat.alpha_cutoff),
+                float(mat.specular_color[0]), float(mat.specular_color[1]), float(mat.specular_color[2]),
+            ])
+        raw_mat_array = np.array(raw_mat_list, dtype=np.float32)
+        # Pack uint fields using struct
+        for i, mat in enumerate(self.material_data_list):
+            base = i * 16
+            raw_mat_array[base + 3] = np.frombuffer(struct.pack('I', mat.flags), dtype=np.float32)[0]
+            raw_mat_array[base + 7] = np.frombuffer(struct.pack('I', mat.shading_model), dtype=np.float32)[0]
+            raw_mat_array[base + 10] = np.frombuffer(struct.pack('I', mat.texture_flags), dtype=np.float32)[0]
+            raw_mat_array[base + 11] = np.frombuffer(struct.pack('I', mat.alpha_mode), dtype=np.float32)[0]
+        self.raw_material_descs_buffer = device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="raw_material_descs_buffer",
+            data=raw_mat_array,
+        )
 
         # Prepare mesh descriptors
         vertex_count = 0
@@ -275,6 +309,12 @@ class Scene:
             label="vertex_buffer",
             data=vertices,
         )
+        # Raw float buffer for software RT (avoids struct padding issues on Metal)
+        self.raw_vertex_buffer = device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="raw_vertex_buffer",
+            data=vertices.flatten().astype(np.float32),
+        )
 
         self.index_buffer = device.create_buffer(
             usage=spy.BufferUsage.shader_resource,
@@ -290,6 +330,16 @@ class Scene:
             label="mesh_descs_buffer",
             data=mesh_descs_data,
         )
+        # Raw uint buffer for software RT
+        raw_mesh_descs_data = np.array(
+            [[d.vertex_count, d.index_count, d.vertex_offset, d.index_offset] for d in self.mesh_descs],
+            dtype=np.uint32
+        ).flatten()
+        self.raw_mesh_descs_buffer = device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="raw_mesh_descs_buffer",
+            data=raw_mesh_descs_data,
+        )
 
         instance_descs_data = np.frombuffer(
             b"".join(d.pack() for d in self.instance_descs), dtype=np.uint8
@@ -298,6 +348,16 @@ class Scene:
             usage=spy.BufferUsage.shader_resource,
             label="instance_descs_buffer",
             data=instance_descs_data,
+        )
+        # Raw uint buffer for software RT
+        raw_inst_descs_data = np.array(
+            [[d.mesh_id, d.material_id, d.transform_id, d.instance_flags] for d in self.instance_descs],
+            dtype=np.uint32
+        ).flatten()
+        self.raw_instance_descs_buffer = device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="raw_instance_descs_buffer",
+            data=raw_inst_descs_data,
         )
 
         # Prepare transforms
@@ -316,101 +376,123 @@ class Scene:
             data=np.stack([t.to_numpy() for t in self.inverse_transpose_transforms]),
         )
 
-        # Build BLASes
-        self.blases = [self.build_blas(mesh_desc) for mesh_desc in self.mesh_descs]
+        # Build software BVH acceleration structures
+        self._build_software_bvh(scene_node)
 
-        # Build TLAS
-        self.tlas = self.build_tlas()
+    def _build_software_bvh(self, scene_node: SceneNode):
+        """Build CPU-side BVH2 for all meshes (BLAS) and instances (TLAS)."""
+        # Get raw numpy vertex/index data for BVH construction
+        all_vertices = np.concatenate([mesh.vertices for mesh in scene_node.meshes], axis=0)
+        all_indices = np.concatenate([mesh.indices for mesh in scene_node.meshes], axis=0)
 
-    def build_blas(self, mesh_desc: MeshDesc):
-        build_input = spy.AccelerationStructureBuildInputTriangles(
-            {
-                "vertex_buffers": [
-                    {
-                        "buffer": self.vertex_buffer,
-                        "offset": mesh_desc.vertex_offset * 32,
-                    }
-                ],
-                "vertex_format": spy.Format.rgb32_float,
-                "vertex_count": mesh_desc.vertex_count,
-                "vertex_stride": 32,
-                "index_buffer": {
-                    "buffer": self.index_buffer,
-                    "offset": mesh_desc.index_offset * 4,
-                },
-                "index_format": spy.IndexFormat.uint32,
-                "index_count": mesh_desc.index_count,
-                # Use 'none' instead of 'opaque' to allow alpha testing in any-hit shader
-                "flags": spy.AccelerationStructureGeometryFlags.none,
-            }
+        # Build per-mesh BLAS
+        blas_nodes_list = []
+        blas_prim_indices_list = []
+        blas_offsets = []
+        blas_prim_offsets = []
+        
+        node_offset = 0
+        prim_offset = 0
+        
+        for mesh_desc in self.mesh_descs:
+            # Extract this mesh's vertices and indices
+            v_start = mesh_desc.vertex_offset
+            v_end = v_start + mesh_desc.vertex_count
+            mesh_verts = all_vertices[v_start:v_end]
+            
+            num_tris = mesh_desc.index_count // 3
+            i_start = mesh_desc.index_offset // 3 if mesh_desc.index_offset % 3 == 0 else mesh_desc.index_offset
+            # indices are stored flat, each group of 3 = one triangle
+            # all_indices shape is (total_tris, 3)
+            tri_start = mesh_desc.index_offset // 3
+            tri_end = tri_start + num_tris
+            mesh_indices = all_indices[tri_start:tri_end]
+            
+            bvh_nodes, prim_order = build_blas_for_mesh(mesh_verts, mesh_indices)
+            
+            blas_offsets.append(node_offset)
+            blas_prim_offsets.append(prim_offset)
+            
+            blas_nodes_list.append(bvh_nodes)
+            blas_prim_indices_list.append(prim_order.astype(np.uint32))
+            
+            node_offset += bvh_nodes.shape[0]
+            prim_offset += prim_order.shape[0]
+        
+        # Concatenate all BLAS data
+        if blas_nodes_list:
+            all_blas_nodes = np.concatenate(blas_nodes_list, axis=0)
+            all_blas_prim_indices = np.concatenate(blas_prim_indices_list, axis=0)
+        else:
+            all_blas_nodes = np.zeros((1, 8), dtype=np.uint32)
+            all_blas_prim_indices = np.zeros(1, dtype=np.uint32)
+        
+        # Build TLAS from instance world-space AABBs
+        instance_aabbs = []
+        for inst_desc in self.instance_descs:
+            mesh_desc = self.mesh_descs[inst_desc.mesh_id]
+            v_start = mesh_desc.vertex_offset
+            v_end = v_start + mesh_desc.vertex_count
+            mesh_verts = all_vertices[v_start:v_end]
+            
+            num_tris = mesh_desc.index_count // 3
+            tri_start = mesh_desc.index_offset // 3
+            tri_end = tri_start + num_tris
+            mesh_indices = all_indices[tri_start:tri_end]
+            
+            transform = self.transforms[inst_desc.transform_id].to_numpy()
+            aabb = compute_mesh_world_aabb(mesh_verts, mesh_indices, transform)
+            instance_aabbs.append(aabb)
+        
+        if instance_aabbs:
+            tlas_nodes, instance_order = build_tlas_for_instances(instance_aabbs)
+        else:
+            tlas_nodes = np.zeros((1, 8), dtype=np.uint32)
+            instance_order = np.zeros(1, dtype=np.uint32)
+        
+        # Compute inverse transforms for ray transformation to object space
+        inverse_transforms = [spy.math.inverse(t) for t in self.transforms]
+        
+        # Create GPU buffers (flatten BVH nodes for StructuredBuffer<uint>)
+        self.tlas_nodes_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="tlas_nodes",
+            data=tlas_nodes.flatten().astype(np.uint32),
         )
-
-        build_desc = spy.AccelerationStructureBuildDesc({"inputs": [build_input]})
-
-        sizes = self.device.get_acceleration_structure_sizes(build_desc)
-
-        blas_scratch_buffer = self.device.create_buffer(
-            size=sizes.scratch_size,
-            usage=spy.BufferUsage.unordered_access,
-            label="blas_scratch_buffer",
+        self.tlas_instance_order_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="tlas_instance_order",
+            data=instance_order.astype(np.uint32),
         )
-
-        blas = self.device.create_acceleration_structure(
-            size=sizes.acceleration_structure_size,
-            label="blas",
+        self.blas_nodes_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="blas_nodes",
+            data=all_blas_nodes.flatten().astype(np.uint32),
         )
-
-        command_encoder = self.device.create_command_encoder()
-        command_encoder.build_acceleration_structure(
-            desc=build_desc, dst=blas, src=None, scratch_buffer=blas_scratch_buffer
+        self.blas_offsets_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="blas_offsets",
+            data=np.array(blas_offsets, dtype=np.uint32),
         )
-        self.device.submit_command_buffer(command_encoder.finish())
-
-        return blas
-
-    def build_tlas(self):
-        instance_list = self.device.create_acceleration_structure_instance_list(
-            size=len(self.instance_descs)
+        self.blas_prim_indices_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="blas_prim_indices",
+            data=all_blas_prim_indices,
         )
-        for instance_id, instance_desc in enumerate(self.instance_descs):
-            instance_list.write(
-                instance_id,
-                {
-                    "transform": spy.float3x4(self.transforms[instance_desc.transform_id]),
-                    "instance_id": instance_id,
-                    "instance_mask": 0xFF,
-                    "instance_contribution_to_hit_group_index": 0,
-                    "flags": spy.AccelerationStructureInstanceFlags.none,
-                    "acceleration_structure": self.blases[instance_desc.mesh_id].handle,
-                },
-            )
-
-        build_desc = spy.AccelerationStructureBuildDesc(
-            {
-                "inputs": [instance_list.build_input_instances()],
-            }
+        self.blas_prim_offsets_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="blas_prim_offsets",
+            data=np.array(blas_prim_offsets, dtype=np.uint32),
         )
-
-        sizes = self.device.get_acceleration_structure_sizes(build_desc)
-
-        tlas_scratch_buffer = self.device.create_buffer(
-            size=sizes.scratch_size,
-            usage=spy.BufferUsage.unordered_access,
-            label="tlas_scratch_buffer",
+        self.inverse_transforms_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="inverse_transforms",
+            data=np.stack([t.to_numpy() for t in inverse_transforms]),
         )
-
-        tlas = self.device.create_acceleration_structure(
-            size=sizes.acceleration_structure_size,
-            label="tlas",
-        )
-
-        command_encoder = self.device.create_command_encoder()
-        command_encoder.build_acceleration_structure(
-            desc=build_desc, dst=tlas, src=None, scratch_buffer=tlas_scratch_buffer
-        )
-        self.device.submit_command_buffer(command_encoder.finish())
-
-        return tlas
+        
+        print(f"[Scene] Software BVH built: {len(blas_offsets)} BLAS, "
+              f"{all_blas_nodes.shape[0]} total BLAS nodes, "
+              f"{tlas_nodes.shape[0]} TLAS nodes")
 
     def _generate_static_atmosphere_luts(self):
         """Generate transmittance and multi-scattering LUTs (only needed once)."""
@@ -649,12 +731,24 @@ class Scene:
             self._sun_direction_dirty = True
 
     def bind(self, cursor: spy.ShaderCursor):
-        cursor["tlas"] = self.tlas
-        cursor["material_descs"] = self.material_descs_buffer  # Bind as StructuredBuffer<MaterialDesc>
+        # Software RT BVH buffers
+        cursor["tlas_nodes"] = self.tlas_nodes_buffer
+        cursor["tlas_instance_order"] = self.tlas_instance_order_buffer
+        cursor["blas_nodes"] = self.blas_nodes_buffer
+        cursor["blas_offsets"] = self.blas_offsets_buffer
+        cursor["blas_prim_indices"] = self.blas_prim_indices_buffer
+        cursor["blas_prim_offsets"] = self.blas_prim_offsets_buffer
+        cursor["inverse_transforms"] = self.inverse_transforms_buffer
+        
+        cursor["material_descs"] = self.material_descs_buffer
+        cursor["raw_material_descs"] = self.raw_material_descs_buffer
         cursor["mesh_descs"] = self.mesh_descs_buffer
         cursor["instance_descs"] = self.instance_descs_buffer
         cursor["vertices"] = self.vertex_buffer
         cursor["indices"] = self.index_buffer
+        cursor["raw_vertices"] = self.raw_vertex_buffer
+        cursor["raw_mesh_descs"] = self.raw_mesh_descs_buffer
+        cursor["raw_instance_descs"] = self.raw_instance_descs_buffer
         cursor["transforms"] = self.transform_buffer
         cursor["inverse_transpose_transforms"] = self.inverse_transpose_transforms_buffer
         cursor["transmittance_lut"] = self.transmittance_lut_gen.get_texture()
@@ -666,7 +760,6 @@ class Scene:
         cursor["frame_index"] = self._frame_index
         
         # Bind directional light parameters
-        # Direction is same as sun_direction (pointing toward the sun)
         cursor["directional_light"]["direction"] = self._sun_direction
         cursor["directional_light"]["cos_half_angle"] = self._directional_light_cos_half_angle
         cursor["directional_light"]["color"] = self._directional_light_color

@@ -76,23 +76,15 @@ void compute_main(uint3 tid: SV_DispatchThreadID)
     if (any(pixel >= dim))
         return;
 
-#if 0 // DEBUG: Direct texture output without lighting
+#if 0 // DEBUG: Direct base_color output from raw material buffer
     Ray ray = g_scene.camera.compute_ray_pinhole(pixel, dim);
     HitInfo hit = g_scene.intersect(ray);
     
     if (hit.valid) {
-        InstanceDesc inst = g_scene.instance_descs[hit.instance_id];
-        MaterialDesc material = g_scene.load_material_desc(inst.material_id);
-        Vertex vertex = g_scene.get_vertex(hit);
-        
-        if (material.has_base_color_texture()) {
-            float4 tex_sample = material.base_color_tex_handle.SampleLevel(g_scene.linear_sampler, vertex.uv, 0);
-            g_output[pixel] = float4(tex_sample.rgb, 1);
-        } else {
-            g_output[pixel] = float4(material.base_color, 1);
-        }
+        MaterialDesc material = g_scene.get_material(hit);
+        g_output[pixel] = float4(material.base_color, 1);
     } else {
-        g_output[pixel] = float4(g_scene.sample_sky_lut(ray.dir), 1);
+        g_output[pixel] = float4(0, 0, 0, 1);
     }
     return;
 #endif
