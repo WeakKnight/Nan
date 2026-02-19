@@ -428,8 +428,8 @@ struct Scene {
 
     float get_linear_depth(float3 world_position)
     {
-        float4 clip = mul(camera.view_proj_matrix_no_jitter, float4(world_position, 1.0f));
-        return clip.z / clip.w;
+        float4 view = mul(camera.view_matrix, float4(world_position, 1.0f));
+        return -view.z;
     }
 
     HitInfo intersect(Ray ray)
