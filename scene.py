@@ -23,6 +23,7 @@ from event_dispatcher import SyncEventDispatcher
 from atmosphere import AtmosphereTransmittanceLUT, AtmosphereMultiScatteringLUT, AtmosphereSkyViewLUT
 from sun_position import SunPosition, SunPositionData
 from texture_manager import TextureManager, TextureType, TextureRecord
+from static_shadow_depth_map import StaticShadowDepthMap
 
 
 class Scene:
@@ -100,6 +101,14 @@ class Scene:
             mag_filter=spy.TextureFilteringMode.linear,
             mip_filter=spy.TextureFilteringMode.linear,
         )
+        self.static_shadow_sampler: Sampler = device.create_sampler(
+            address_u=spy.TextureAddressingMode.clamp_to_edge,
+            address_v=spy.TextureAddressingMode.clamp_to_edge,
+            address_w=spy.TextureAddressingMode.clamp_to_edge,
+            min_filter=spy.TextureFilteringMode.linear,
+            mag_filter=spy.TextureFilteringMode.linear,
+            mip_filter=spy.TextureFilteringMode.linear,
+        )
         self.camera: Camera = scene_node.camera
         self.asset_path: str = scene_node.asset_path
         
@@ -119,6 +128,7 @@ class Scene:
         # UI elements
         self._hours_slider: spy.ui.SliderFloat | None = None
         self._intensity_slider: spy.ui.SliderFloat | None = None
+        self._static_shadow_status_text: spy.ui.Text | None = None
         
         # Location for sun position calculation (default: Chengdu, async update)
         self._latitude: float = SunPosition.DEFAULT_LATITUDE
@@ -128,6 +138,23 @@ class Scene:
         
         # Frame index for stochastic alpha
         self._frame_index: int = 0
+
+        # Static shadow depth map state. The renderer falls back to realtime
+        # ray-query shadows until a valid bake is produced.
+        self.static_shadow_resolution: int = 2048
+        self.static_shadow_depth_bias: float = 0.0015
+        self.static_shadow_enabled: bool = False
+        self.static_shadow_depth_texture: spy.Texture = device.create_texture(
+            format=spy.Format.r32_float,
+            width=1,
+            height=1,
+            usage=spy.TextureUsage.shader_resource,
+            label="static_shadow_default_depth",
+            data=np.ones((1, 1), dtype=np.float32),
+        )
+        self.static_shadow_world_to_light: spy.float4x4 = spy.float4x4.identity()
+        self.static_shadow_baked_sun_direction: tuple[float, float, float] | None = None
+        self.static_shadow_baker = StaticShadowDepthMap(device)
         
         # Start async location fetch
         # SunPosition.get_current_location_async(self._on_location_received)
@@ -315,6 +342,7 @@ class Scene:
             label="inverse_transpose_transforms_buffer",
             data=np.stack([t.to_numpy() for t in self.inverse_transpose_transforms]),
         )
+        self.scene_bounds_min, self.scene_bounds_max = self._compute_scene_bounds(scene_node)
 
         # Build BLASes
         self.blases = [self.build_blas(mesh_desc) for mesh_desc in self.mesh_descs]
@@ -411,6 +439,119 @@ class Scene:
         self.device.submit_command_buffer(command_encoder.finish())
 
         return tlas
+
+    def _compute_scene_bounds(self, scene_node: SceneNode) -> tuple[np.ndarray, np.ndarray]:
+        bounds_min = np.array([np.inf, np.inf, np.inf], dtype=np.float32)
+        bounds_max = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float32)
+
+        for mesh_id, _, transform_id in scene_node.instances:
+            positions = scene_node.meshes[mesh_id].vertices[:, 0:3]
+            transform = np.asarray(scene_node.transforms[transform_id].matrix.to_numpy(), dtype=np.float32)
+            homogeneous = np.concatenate(
+                [positions, np.ones((positions.shape[0], 1), dtype=np.float32)],
+                axis=1,
+            )
+            world_positions = (transform @ homogeneous.T).T[:, 0:3]
+            bounds_min = np.minimum(bounds_min, world_positions.min(axis=0))
+            bounds_max = np.maximum(bounds_max, world_positions.max(axis=0))
+
+        if not np.all(np.isfinite(bounds_min)) or not np.all(np.isfinite(bounds_max)):
+            bounds_min = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
+            bounds_max = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+
+        extent = bounds_max - bounds_min
+        pad = np.maximum(extent * 0.01, np.array([0.01, 0.01, 0.01], dtype=np.float32))
+        return bounds_min - pad, bounds_max + pad
+
+    def _make_static_shadow_matrices(self) -> tuple[spy.float4x4, spy.float4x4]:
+        sun_direction = np.array(
+            [float(self._sun_direction[0]), float(self._sun_direction[1]), float(self._sun_direction[2])],
+            dtype=np.float32,
+        )
+        sun_norm = np.linalg.norm(sun_direction)
+        if sun_norm <= 1e-6:
+            sun_direction = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        else:
+            sun_direction /= sun_norm
+
+        z_axis = -sun_direction  # Incoming light direction, from sun toward the scene.
+        helper_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        if abs(float(np.dot(helper_up, z_axis))) > 0.95:
+            helper_up = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+        x_axis = np.cross(helper_up, z_axis)
+        x_axis /= np.linalg.norm(x_axis)
+        y_axis = np.cross(z_axis, x_axis)
+        y_axis /= np.linalg.norm(y_axis)
+
+        corners = np.array(
+            [
+                [x, y, z]
+                for x in (self.scene_bounds_min[0], self.scene_bounds_max[0])
+                for y in (self.scene_bounds_min[1], self.scene_bounds_max[1])
+                for z in (self.scene_bounds_min[2], self.scene_bounds_max[2])
+            ],
+            dtype=np.float32,
+        )
+        light_space = np.stack(
+            [corners @ x_axis, corners @ y_axis, corners @ z_axis],
+            axis=1,
+        )
+        light_min = light_space.min(axis=0)
+        light_max = light_space.max(axis=0)
+        light_extent = np.maximum(light_max - light_min, np.array([1e-4, 1e-4, 1e-4], dtype=np.float32))
+
+        world_to_shadow = np.array(
+            [
+                [x_axis[0] / light_extent[0], x_axis[1] / light_extent[0], x_axis[2] / light_extent[0], -light_min[0] / light_extent[0]],
+                [y_axis[0] / light_extent[1], y_axis[1] / light_extent[1], y_axis[2] / light_extent[1], -light_min[1] / light_extent[1]],
+                [z_axis[0] / light_extent[2], z_axis[1] / light_extent[2], z_axis[2] / light_extent[2], -light_min[2] / light_extent[2]],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        shadow_to_world = np.linalg.inv(world_to_shadow).astype(np.float32)
+        return spy.float4x4(world_to_shadow), spy.float4x4(shadow_to_world)
+
+    def _reset_accumulation(self):
+        self.event_distpacher.dispatch("camera_move", None)
+
+    def _set_static_shadow_status(self, text: str):
+        if self._static_shadow_status_text is not None:
+            try:
+                self._static_shadow_status_text.text = text
+            except AttributeError:
+                pass
+
+    def bake_static_shadow_depth_map(self):
+        self.static_shadow_world_to_light, shadow_to_world = self._make_static_shadow_matrices()
+        shadow_depth_texture = self.device.create_texture(
+            format=spy.Format.r32_float,
+            width=self.static_shadow_resolution,
+            height=self.static_shadow_resolution,
+            usage=spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access,
+            label="static_shadow_depth_map",
+        )
+
+        command_encoder = self.device.create_command_encoder()
+        self.static_shadow_baker.execute(
+            command_encoder,
+            self,
+            shadow_depth_texture,
+            shadow_to_world,
+        )
+        self.device.submit_command_buffer(command_encoder.finish())
+
+        self.static_shadow_depth_texture = shadow_depth_texture
+        self.static_shadow_enabled = True
+        self.static_shadow_baked_sun_direction = (
+            float(self._sun_direction[0]),
+            float(self._sun_direction[1]),
+            float(self._sun_direction[2]),
+        )
+        self._set_static_shadow_status(f"Static shadow baked: {self.static_shadow_resolution}x{self.static_shadow_resolution}")
+        self._reset_accumulation()
+        print(f"[Scene] Static shadow depth map baked at {self.static_shadow_resolution}x{self.static_shadow_resolution}")
 
     def _generate_static_atmosphere_luts(self):
         """Generate transmittance and multi-scattering LUTs (only needed once)."""
@@ -622,6 +763,12 @@ class Scene:
         self._hours_slider = spy.ui.SliderFloat(ui_window, 'Hours', min=0, max=23.99, value=current_hours)
         # Directional light intensity slider (0 to 20, default: PI)
         self._intensity_slider = spy.ui.SliderFloat(ui_window, 'Sun Intensity', min=0, max=20, value=self._directional_light_intensity)
+        
+        def bake_static_shadow_btn():
+            self.bake_static_shadow_depth_map()
+        
+        spy.ui.Button(ui_window, 'Bake Static Shadow Depth Map', callback=bake_static_shadow_btn)
+        self._static_shadow_status_text = spy.ui.Text(ui_window, 'Static shadow: not baked')
         # Initialize sun position with current time
         self._update_sun_from_hours(current_hours)
     
@@ -647,6 +794,10 @@ class Scene:
             self._sun_direction[2] != value[2]):
             self._sun_direction = value
             self._sun_direction_dirty = True
+            if self.static_shadow_enabled:
+                self.static_shadow_enabled = False
+                self._set_static_shadow_status('Static shadow: sun changed, rebake needed')
+                self._reset_accumulation()
 
     def bind(self, cursor: spy.ShaderCursor):
         cursor["tlas"] = self.tlas
@@ -664,6 +815,12 @@ class Scene:
         cursor["sun_direction"] = self._sun_direction
         cursor["instance_count"] = len(self.instance_descs)
         cursor["frame_index"] = self._frame_index
+        cursor["static_shadow"]["depth_texture"] = self.static_shadow_depth_texture
+        cursor["static_shadow"]["depth_sampler"] = self.static_shadow_sampler
+        cursor["static_shadow"]["world_to_shadow"] = self.static_shadow_world_to_light
+        cursor["static_shadow"]["enabled"] = 1 if self.static_shadow_enabled else 0
+        cursor["static_shadow"]["resolution"] = self.static_shadow_resolution
+        cursor["static_shadow"]["depth_bias"] = self.static_shadow_depth_bias
         
         # Bind directional light parameters
         # Direction is same as sun_direction (pointing toward the sun)

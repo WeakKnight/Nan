@@ -16,6 +16,17 @@ struct DirectionalLight {
     }
 };
 
+struct StaticShadowDepthMapData {
+    Texture2D<float> depth_texture;
+    SamplerState depth_sampler;
+    float4x4 world_to_shadow;
+    uint enabled;
+    uint resolution;
+    float depth_bias;
+    uint pad0;
+    uint pad1;
+};
+
 // Sky atmosphere constants (from atmosphere.slang)
 static const float groundRadiusMM = 6.360;
 static const float atmosphereRadiusMM = 6.460;
@@ -48,6 +59,7 @@ struct Scene {
     float3 sun_direction;
     
     DirectionalLight directional_light;
+    StaticShadowDepthMapData static_shadow;
 
     Camera camera;
 
@@ -379,6 +391,43 @@ struct Scene {
     
     // Sample directional light with NEE (Next Event Estimation)
     // Returns: xyz = radiance contribution, w = pdf
+    float sample_static_sun_visibility(ShadingData sd, float3 light_dir)
+    {
+        Ray shadow_ray = Ray(sd.compute_new_ray_origin(), light_dir);
+        if (static_shadow.enabled == 0)
+            return get_visibility(shadow_ray);
+
+        float4 shadow_position_h = mul(static_shadow.world_to_shadow, float4(shadow_ray.origin, 1.0));
+        float3 shadow_position = shadow_position_h.xyz / max(abs(shadow_position_h.w), 1e-6);
+
+        if (shadow_position.x < 0.0 || shadow_position.x > 1.0 ||
+            shadow_position.y < 0.0 || shadow_position.y > 1.0 ||
+            shadow_position.z < 0.0 || shadow_position.z > 1.0)
+        {
+            return get_visibility(shadow_ray);
+        }
+
+        float2 texel_size = 1.0 / float2(max(static_shadow.resolution, 1));
+        float visibility = 0.0;
+        [unroll]
+        for (int y = -1; y <= 1; y++)
+        {
+            [unroll]
+            for (int x = -1; x <= 1; x++)
+            {
+                float2 sample_uv = clamp(
+                    shadow_position.xy + float2(x, y) * texel_size,
+                    float2(0.0),
+                    float2(1.0)
+                );
+                float baked_depth = static_shadow.depth_texture.SampleLevel(static_shadow.depth_sampler, sample_uv, 0);
+                visibility += (shadow_position.z <= baked_depth + static_shadow.depth_bias) ? 1.0 : 0.0;
+            }
+        }
+
+        return visibility / 9.0;
+    }
+
     float4 sample_directional_light(ShadingData sd, float2 rand_sample)
     {
         // Sample direction within sun disk cone
@@ -391,8 +440,7 @@ struct Scene {
         float pdf = sample_result.w;
         
         // Visibility test
-        Ray shadow_ray = Ray(sd.compute_new_ray_origin(), L_dir);
-        float visibility = get_visibility(shadow_ray);
+        float visibility = sample_static_sun_visibility(sd, L_dir);
         
         // Lambertian BRDF evaluation
         float NdotL = max(0.0, dot(sd.shading_frame.n, L_dir));

@@ -116,7 +116,7 @@ class App:
         self.renderer.initialize(self.device, self.scene)
         if self.ui is not None:
             ui_window = spy.ui.Window(
-                self.ui.screen, "Settings", spy.float2(10, 10), spy.float2(300, 100)
+                self.ui.screen, "Settings", spy.float2(10, 10), spy.float2(360, 180)
             )
 
             # def render_doc_capture_btn():
