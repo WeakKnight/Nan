@@ -6,4 +6,11 @@ code_ref/
 .claude/
 .codebuddy/
 headless_output.png
+headless_smoke.png
+*_smoke.png
+sst_bistro_*.json
+sst_bistro_*.md
+sst_bistro_summary.md
+static_shadow_compare_bistro*/
+static_shadow_compare_bistro*.md
 sst_encoder_build/
