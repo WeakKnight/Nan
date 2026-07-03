@@ -15,6 +15,7 @@ class PathTracingRenderer:
         self.path_tracer: PathTracer = PathTracer(device, scene)
         self.accumulator: Accumulator = Accumulator(device, resource_key="path_tracing_renderer.accumulator_history")
         self.tone_mapper: ToneMapper = ToneMapper(device)
+        self.extension_manager = getattr(scene, "extensions", None)
 
         self.render_texture: spy.Texture | None = None  # type: ignore (assigned during render)
         self.accum_texture: spy.Texture | None = None  # type: ignore (assigned during render)
@@ -55,7 +56,23 @@ class PathTracingRenderer:
         self.render_texture = render_texture
         self.accum_texture = accum_texture
 
-        self.path_tracer.execute(command_encoder, render_texture, frame)
+        shadow_mask = None
+        if self.extension_manager is not None:
+            shadow_mask = self.extension_manager.create_screen_shadow_mask(
+                command_encoder,
+                scene,
+                render_data,
+                output.width,
+                output.height,
+            )
+
+        self.path_tracer.execute(
+            command_encoder,
+            render_texture,
+            frame,
+            static_shadow_mask=shadow_mask,
+            use_static_shadow_mask=shadow_mask is not None,
+        )
         self.accumulator.execute(
             command_encoder,
             render_data,

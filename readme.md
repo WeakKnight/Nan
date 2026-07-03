@@ -9,6 +9,19 @@ An **educational** real-time GPU path tracing renderer built with SlangPy.
 - **Simple unidirectional path tracing** - Easy to understand and extend
 - **Lambert BSDF only** - No complex material models, perfect for learning
 - **Headless mode** - Render without a window, ideal for AI-assisted debugging
+- **Static shadow mask experiments** - Compact SST shadow queries can be sampled through a screen-space adaptive mask.
+
+## Example: Adaptive Static Shadow Mask
+
+Nan can pre-bake a static sun shadow map into a Compact Static Shadow Tree (SST), then sample it through a screen-space adaptive shadow mask. This Bistro capture uses an 8192-budget Compact SST at 11:00 sun time. The adaptive wave mask shades only **288,899 / 921,600** screen pixels (**31.35%**) while saving **68.65%** of shadow-mask shading work. Against the full per-pixel mask, the adaptive mask measured **MAE 0.000518**, **RMSE 0.01612**, and **0.197%** of pixels changed by more than `1e-3`.
+
+| Standard full mask | Adaptive wave mask |
+| --- | --- |
+| ![Standard full screen shadow mask](docs/media/static-shadow-mask/standard_full_shadow_mask_8192_11.png) | ![Adaptive wave screen shadow mask](docs/media/static-shadow-mask/adaptive_wave_shadow_mask_8192_11.png) |
+
+| Adaptive true-shade pixels | Absolute error map |
+| --- | --- |
+| ![Adaptive true-shade pixel heatmap](docs/media/static-shadow-mask/adaptive_true_shade_heatmap_8192_11.png) | ![Adaptive shadow mask error map](docs/media/static-shadow-mask/adaptive_error_map_8192_11.png) |
 
 ## Quick Start
 

@@ -122,6 +122,13 @@ def parse_args() -> argparse.Namespace:
         help="Enable scripted camera controller motion test.",
     )
     parser.add_argument(
+        "--enable-extension",
+        action="append",
+        default=[],
+        metavar="NAME[,NAME...]",
+        help="Enable optional rendering extensions. Built-in: static_shadow_sst. External form: python.module:ExtensionClass.",
+    )
+    parser.add_argument(
         "--static-shadow-mode",
         choices=("none", "realtime", "depth", "sst", "packed", "compact", "compact-pcf", "decompressed", "decomp"),
         default="none",
@@ -224,6 +231,24 @@ def parse_args() -> argparse.Namespace:
         choices=("quality", "high-compression", "high_compression", "manual"),
         default="quality",
         help="Runtime SST preset. quality=Dual Visible/tile128/leaf2, high-compression=Dual Relaxed Visible/tile128/leaf2; explicit SST options still override.",
+    )
+    parser.add_argument(
+        "--static-shadow-mask",
+        choices=("off", "full", "adaptive", "adaptive-wave"),
+        default="off",
+        help="Screen-space static shadow mask mode. adaptive-wave uses wave-level DistributeWork after a sparse 4x4 bootstrap.",
+    )
+    parser.add_argument(
+        "--static-shadow-mask-threshold",
+        type=float,
+        default=0.02,
+        help="Adaptive shadowmask max-min neighbor threshold. Lower values shade more pixels and reduce interpolation error.",
+    )
+    parser.add_argument(
+        "--static-shadow-mask-bootstrap-passes",
+        type=int,
+        default=2,
+        help="Adaptive shadowmask passes forced to true SST sampling before interpolation is allowed. 0 is fastest, 2 is conservative.",
     )
     parser.add_argument(
         "--sst-plane-error-threshold",
@@ -356,6 +381,33 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated SST variants used by --sst-sweep.",
     )
     return parser.parse_args()
+
+
+def _normalize_extension_name(value: str) -> str:
+    raw = value.strip()
+    if ":" in raw:
+        return raw
+    name = raw.lower().replace("-", "_")
+    aliases = {
+        "static_shadow": "static_shadow_sst",
+        "sst": "static_shadow_sst",
+        "static_sst": "static_shadow_sst",
+    }
+    return aliases.get(name, name)
+
+
+def _enabled_extensions_from_args(args: argparse.Namespace, static_shadow_mode: int | None) -> tuple[str, ...]:
+    enabled: list[str] = []
+    for value in args.enable_extension or ():
+        for item in value.split(","):
+            name = _normalize_extension_name(item)
+            if name and name not in enabled:
+                enabled.append(name)
+
+    static_shadow_requested = static_shadow_mode is not None or args.static_shadow_mask != "off"
+    if static_shadow_requested and "static_shadow_sst" not in enabled:
+        enabled.append("static_shadow_sst")
+    return tuple(enabled)
 
 
 def _parse_float_list(value: str, fallback: tuple[float, ...]) -> tuple[float, ...]:
@@ -2739,6 +2791,7 @@ def run_static_shadow_compare(args: argparse.Namespace) -> None:
     )
     app = App(config=config)
     app.set_renderer(PathTracingRenderer())
+    app.scene.set_sst_encoder_backend(args.sst_encoder)
     app.scene.set_static_shadow_resolution(args.shadow_resolution)
     _apply_runtime_sst_options(app.scene, args)
     app.scene.static_shadow_auto_encode_sst = False
@@ -2878,6 +2931,7 @@ def run_sst_benchmark(args: argparse.Namespace) -> None:
     )
     app = App(config=config)
     scene = app.scene
+    scene.set_sst_encoder_backend(args.sst_encoder)
     scene.set_static_shadow_resolution(args.shadow_resolution)
     scene.static_shadow_auto_encode_sst = False
     shadow_bias = scene.static_shadow_depth_bias if args.sst_shadow_bias is None else max(0.0, args.sst_shadow_bias)
@@ -3211,6 +3265,8 @@ def main() -> None:
     from app import App, AppConfig
     from path_tracing_renderer import PathTracingRenderer
 
+    static_shadow_mode = _parse_static_shadow_mode(args.static_shadow_mode)
+    enabled_extensions = _enabled_extensions_from_args(args, static_shadow_mode)
     renderer = PathTracingRenderer()
 
     base_config = AppConfig()
@@ -3226,13 +3282,18 @@ def main() -> None:
         srgb_output=not args.no_srgb,
         camera_move_test=args.camera_move_test,
         scene_path=args.scene,
-        static_shadow_mode=_parse_static_shadow_mode(args.static_shadow_mode),
+        enabled_extensions=enabled_extensions,
+        static_shadow_mode=static_shadow_mode,
         static_shadow_resolution=args.shadow_resolution,
         sst_encoder_backend=args.sst_encoder,
+        static_shadow_mask_mode=args.static_shadow_mask,
+        static_shadow_mask_threshold=max(0.0, float(args.static_shadow_mask_threshold)),
+        static_shadow_mask_bootstrap_passes=max(0, min(4, int(args.static_shadow_mask_bootstrap_passes))),
     )
 
     app = App(config=config)
-    _apply_runtime_sst_options(app.scene, args)
+    if app.extensions.has("static_shadow_sst"):
+        _apply_runtime_sst_options(app.scene, args)
     app.set_renderer(renderer)
     app.main_loop()
 

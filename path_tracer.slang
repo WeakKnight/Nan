@@ -24,7 +24,18 @@ struct Path {
 };
 
 RWTexture2D<float4> g_output;
+Texture2D<float> g_static_shadow_mask;
 uniform uint g_frame;
+uniform uint g_use_static_shadow_mask;
+
+float sample_static_shadow_mask(uint2 pixel)
+{
+    uint2 dim;
+    g_static_shadow_mask.GetDimensions(dim.x, dim.y);
+    dim = max(dim, uint2(1, 1));
+    uint2 clamped_pixel = min(pixel, dim - 1);
+    return saturate(g_static_shadow_mask.Load(int3(clamped_pixel, 0)));
+}
 
 void trace_path(inout Path path)
 {
@@ -51,8 +62,14 @@ void trace_path(inout Path path)
         // Add emissive contribution
         path.L += path.thp * shading_data.emissive;
         
-        // NEE: Sample directional light (sun) directly
-        float4 nee_result = g_scene.sample_directional_light(shading_data, path.rng.next_2d());
+        // NEE: Sample directional light (sun) directly.
+        uint use_shadow_mask = (path.vertex_index == 0 && g_use_static_shadow_mask != 0) ? 1 : 0;
+        float visibility_override = use_shadow_mask != 0 ? sample_static_shadow_mask(path.pixel) : 1.0;
+        float4 nee_result = g_scene.sample_directional_light_with_visibility(
+            shading_data,
+            path.rng.next_2d(),
+            visibility_override,
+            use_shadow_mask);
         path.L += path.thp * nee_result.xyz;
         
         // Continue path with BSDF sampling

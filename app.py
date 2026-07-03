@@ -8,6 +8,8 @@ from slangpy.ui import Context
 
 
 import slangpy as spy
+import json
+import math
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -16,10 +18,12 @@ from scene import Scene
 from scene_node import SceneNode
 from renderer import Renderer
 from render_data import RenderData
+from extensions import ExtensionManager
 # install pip package event-dispatching https://pypi.org/project/event-dispatching/
 import event_dispatcher 
 
 PROJECT_DIR = Path(__file__).parent
+SCENE_CAMERA_CONFIG_FILENAME = "nan_camera.json"
 
 
 @dataclass
@@ -33,9 +37,13 @@ class AppConfig:
     srgb_output: bool = True
     camera_move_test: bool = False
     scene_path: str | None = None
+    enabled_extensions: tuple[str, ...] = ()
     static_shadow_mode: int | None = None
     static_shadow_resolution: int | tuple[int, int] | None = None
     sst_encoder_backend: str = "auto"
+    static_shadow_mask_mode: str = "off"
+    static_shadow_mask_threshold: float = 0.02
+    static_shadow_mask_bootstrap_passes: int = 2
 
 class App:
     def __init__(self, config: Optional[AppConfig] = None):
@@ -78,6 +86,9 @@ class App:
 
         self.output_texture: spy.Texture | None = None  # type: ignore (will be set immediately)
         self.render_data: RenderData = RenderData(self.device)
+        self._scene_camera_config_path: Path | None = None
+        self._scene_camera_status_text: spy.ui.Text | None = None
+        self._scene_camera_status: str = "Scene camera: not loaded"
 
         if self.window is not None:
             self.window.on_keyboard_event = self.on_keyboard_event
@@ -85,12 +96,13 @@ class App:
             self.window.on_resize = self.on_resize
 
         self.scene_node: SceneNode = self._load_scene(self.config.scene_path)
+        self._apply_scene_camera_config()
 
         self.event_dispatcher: SyncEventDispatcher = event_dispatcher.SyncEventDispatcher()
         self.scene: Scene = Scene(self.device, self.scene_node, self.event_dispatcher)
-        self.scene.set_sst_encoder_backend(self.config.sst_encoder_backend)
-        if self.config.static_shadow_resolution is not None:
-            self.scene.set_static_shadow_resolution(self.config.static_shadow_resolution)
+        self.extensions: ExtensionManager = ExtensionManager(self.config.enabled_extensions)
+        self.extensions.initialize(self)
+        self.scene.extensions = self.extensions
 
         self.camera_controller: CameraController = CameraController(self.scene_node.camera)
         self.camera_controller.move_test = self.config.camera_move_test
@@ -112,17 +124,132 @@ class App:
             return SceneNode.demo()
         
         path = Path(scene_path)
+        self._scene_camera_config_path = path.resolve().parent / SCENE_CAMERA_CONFIG_FILENAME
         if path.suffix.lower() == ".json":
             return SceneNode.load_json(str(path), axis_conversion="z_up_to_y_up")
         else:
             return SceneNode.load_asset(str(path), scale=0.1)
+
+    def _scene_camera_key(self) -> str | None:
+        if self.config.scene_path is None:
+            return None
+        return Path(self.config.scene_path).name
+
+    @staticmethod
+    def _float3_to_list(value) -> list[float]:
+        return [float(value[0]), float(value[1]), float(value[2])]
+
+    @staticmethod
+    def _read_float3(data, key: str) -> spy.float3:
+        values = data.get(key)
+        if not isinstance(values, list) or len(values) != 3:
+            raise ValueError(f"camera.{key} must be a 3-float array")
+        parsed = [float(values[0]), float(values[1]), float(values[2])]
+        if not all(math.isfinite(v) for v in parsed):
+            raise ValueError(f"camera.{key} contains non-finite values")
+        return spy.float3(parsed[0], parsed[1], parsed[2])
+
+    def _camera_config_payload(self) -> dict:
+        camera = self.scene_node.camera
+        return {
+            "version": 1,
+            "scene": self._scene_camera_key(),
+            "camera": {
+                "position": self._float3_to_list(camera.position),
+                "target": self._float3_to_list(camera.target),
+                "up": self._float3_to_list(camera.up),
+                "fov": float(camera.fov),
+                "near_clip_plane": float(camera.near_clip_plane),
+                "far_clip_plane": float(camera.far_clip_plane),
+                "focal_distance": float(camera.focal_distance),
+            },
+        }
+
+    def _set_scene_camera_status(self, text: str) -> None:
+        self._scene_camera_status = text
+        if self._scene_camera_status_text is not None:
+            self._scene_camera_status_text.text = text
+
+    def _save_scene_camera_config(self) -> None:
+        if self._scene_camera_config_path is None:
+            self._set_scene_camera_status("Scene camera: no scene path")
+            return
+        try:
+            self._scene_camera_config_path.parent.mkdir(parents=True, exist_ok=True)
+            self._scene_camera_config_path.write_text(
+                json.dumps(self._camera_config_payload(), indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self._set_scene_camera_status(f"Scene camera: save failed ({exc})")
+            print(f"[App] Failed to save scene camera config: {exc}")
+            return
+        self._set_scene_camera_status(f"Scene camera: saved {self._scene_camera_config_path.name}")
+        print(f"[App] Scene camera saved to {self._scene_camera_config_path}")
+
+    def _apply_scene_camera_config(self) -> bool:
+        if self._scene_camera_config_path is None:
+            self._set_scene_camera_status("Scene camera: no scene path")
+            return False
+        if not self._scene_camera_config_path.exists():
+            self._set_scene_camera_status(f"Scene camera: no {self._scene_camera_config_path.name}")
+            return False
+
+        try:
+            data = json.loads(self._scene_camera_config_path.read_text(encoding="utf-8"))
+            if data.get("scene") != self._scene_camera_key():
+                self._set_scene_camera_status("Scene camera: config belongs to another scene")
+                return False
+            camera_data = data.get("camera")
+            if not isinstance(camera_data, dict):
+                raise ValueError("camera block is missing")
+
+            camera = self.scene_node.camera
+            camera.position = self._read_float3(camera_data, "position")
+            camera.target = self._read_float3(camera_data, "target")
+            camera.up = self._read_float3(camera_data, "up")
+            camera.fov = float(camera_data.get("fov", camera.fov))
+            camera.near_clip_plane = float(camera_data.get("near_clip_plane", camera.near_clip_plane))
+            camera.far_clip_plane = float(camera_data.get("far_clip_plane", camera.far_clip_plane))
+            camera.focal_distance = float(camera_data.get("focal_distance", camera.focal_distance))
+            if not all(
+                math.isfinite(v)
+                for v in (
+                    camera.fov,
+                    camera.near_clip_plane,
+                    camera.far_clip_plane,
+                    camera.focal_distance,
+                )
+            ):
+                raise ValueError("camera scalar values must be finite")
+            if camera.fov <= 0.0 or camera.fov >= 179.0:
+                raise ValueError("camera.fov must be in (0, 179)")
+            if camera.near_clip_plane <= 0.0:
+                raise ValueError("camera.near_clip_plane must be positive")
+            if camera.far_clip_plane <= camera.near_clip_plane:
+                raise ValueError("camera.far_clip_plane must be greater than near_clip_plane")
+            if camera.focal_distance <= 0.0:
+                raise ValueError("camera.focal_distance must be positive")
+            camera.recompute()
+        except Exception as exc:
+            self._set_scene_camera_status(f"Scene camera: load failed ({exc})")
+            print(f"[App] Failed to load scene camera config: {exc}")
+            return False
+
+        self._set_scene_camera_status(f"Scene camera: loaded {self._scene_camera_config_path.name}")
+        print(f"[App] Scene camera loaded from {self._scene_camera_config_path}")
+        return True
+
+    def _reload_scene_camera_config(self) -> None:
+        if self._apply_scene_camera_config():
+            self.event_dispatcher.dispatch("camera_move")
 
     def set_renderer(self, renderer: Renderer):
         self.renderer = renderer
         self.renderer.initialize(self.device, self.scene)
         if self.ui is not None:
             ui_window = spy.ui.Window(
-                self.ui.screen, "Settings", spy.float2(10, 10), spy.float2(420, 300)
+                self.ui.screen, "Settings", spy.float2(10, 10), spy.float2(420, 380)
             )
 
             # def render_doc_capture_btn():
@@ -131,7 +258,15 @@ class App:
             #
             # # if self.render_doc_is_available:
             # spy.ui.Button(ui_window, 'RenderDoc Capture', callback=render_doc_capture_btn)
-            self.scene.setup_ui(self.ui, ui_window)
+            spy.ui.Button(ui_window, "Save Scene Camera", callback=self._save_scene_camera_config)
+            spy.ui.Button(ui_window, "Reload Scene Camera", callback=self._reload_scene_camera_config)
+            self._scene_camera_status_text = spy.ui.Text(ui_window, self._scene_camera_status)
+            self.scene.setup_ui(
+                self.ui,
+                ui_window,
+                include_static_shadow_controls=self.extensions.has("static_shadow_sst"),
+            )
+            self.extensions.setup_ui(self, self.ui, ui_window)
             self.renderer.setup_ui(self.ui, ui_window)
 
     def on_keyboard_event(self, event: spy.KeyboardEvent):
@@ -174,7 +309,7 @@ class App:
             self.surface.unconfigure()
 
     def main_loop(self):
-        self._configure_static_shadow_if_requested()
+        self.extensions.before_main_loop(self)
         if self.headless:
             self._headless_loop()
         else:
@@ -191,37 +326,13 @@ class App:
         )
 
     def configure_static_shadow_mode(self, requested_mode: int, resolution: int | tuple[int, int] | None = None) -> None:
-        requested_mode = max(Scene.SHADOW_MODE_REALTIME, min(Scene.SHADOW_MODE_DECOMPRESSED_SST, int(requested_mode)))
-        if resolution is not None:
-            self.scene.set_static_shadow_resolution(resolution)
-        if requested_mode == Scene.SHADOW_MODE_REALTIME:
-            self.scene.static_shadow_mode = Scene.SHADOW_MODE_REALTIME
-            return
-
-        needs_sst = requested_mode in (
-            Scene.SHADOW_MODE_SST,
-            Scene.SHADOW_MODE_PACKED_SST,
-            Scene.SHADOW_MODE_COMPACT_SST,
-            Scene.SHADOW_MODE_COMPACT_SST_PCF3,
-            Scene.SHADOW_MODE_DECOMPRESSED_SST,
-        )
-        self.scene.static_shadow_auto_encode_sst = needs_sst
-
-        print(
-            "[App] Baking static shadow before render: "
-            f"mode={requested_mode} size={self.scene.static_shadow_size[0]}x{self.scene.static_shadow_size[1]}"
-        )
-        self.scene.bake_static_shadow_depth_map()
-        if needs_sst and not self.scene.sst_enabled:
-            self.scene.encode_sparse_shadow_tree()
-
-        if needs_sst and not self.scene.sst_enabled:
-            print("[App] Requested SST shadow mode but SST encode failed; falling back to depth texture")
-            requested_mode = Scene.SHADOW_MODE_DEPTH_TEXTURE
-
-        self.scene.static_shadow_mode = requested_mode
-        self.scene._sync_shadow_mode_ui()
-        self.scene._update_static_shadow_status()
+        extension = self.extensions.get("static_shadow_sst")
+        if extension is None:
+            raise RuntimeError(
+                "Static shadow mode requires the 'static_shadow_sst' extension. "
+                "Enable it with --enable-extension static_shadow_sst."
+            )
+        extension.configure_static_shadow_mode(requested_mode, resolution)
 
     def render_headless_to_file(self, output_path: Path, frame_count: int | None = None) -> None:
         if not self.headless:
@@ -292,6 +403,14 @@ class App:
 
             command_encoder = self.device.create_command_encoder()
             self.scene.update()
+            self.extensions.before_render(
+                command_encoder,
+                self.output_texture,
+                frame,
+                self.device,
+                self.scene,
+                self.render_data,
+            )
             if self.renderer is not None:
                 self.renderer.render(
                     command_encoder,
@@ -301,6 +420,14 @@ class App:
                     self.scene,
                     self.render_data,
                 )
+            self.extensions.after_render(
+                command_encoder,
+                self.output_texture,
+                frame,
+                self.device,
+                self.scene,
+                self.render_data,
+            )
             command_encoder.blit(surface_texture, self.output_texture)
 
             if self.ui is not None:
@@ -343,6 +470,14 @@ class App:
 
             command_encoder = self.device.create_command_encoder()
             self.scene.update()
+            self.extensions.before_render(
+                command_encoder,
+                self.output_texture,
+                frame,
+                self.device,
+                self.scene,
+                self.render_data,
+            )
             if self.renderer is not None:
                 self.renderer.render(
                     command_encoder,
@@ -352,6 +487,14 @@ class App:
                     self.scene,
                     self.render_data,
                 )
+            self.extensions.after_render(
+                command_encoder,
+                self.output_texture,
+                frame,
+                self.device,
+                self.scene,
+                self.render_data,
+            )
 
             self.device.submit_command_buffer(command_encoder.finish())
             self.device.flush_print()

@@ -1252,13 +1252,23 @@ class Scene:
             sun_data.sun_direction[2]
         )
     
-    def setup_ui(self, ui_context: spy.ui.Context, ui_window: spy.ui.Window):
+    def setup_ui(
+        self,
+        ui_context: spy.ui.Context,
+        ui_window: spy.ui.Window,
+        include_static_shadow_controls: bool = False,
+    ):
         """Setup scene-related UI elements."""
         now = datetime.now()
         current_hours = now.hour + now.minute / 60.0 + now.second / 3600.0
         self._hours_slider = spy.ui.SliderFloat(ui_window, 'Hours', min=0, max=23.99, value=current_hours)
         # Directional light intensity slider (0 to 20, default: PI)
         self._intensity_slider = spy.ui.SliderFloat(ui_window, 'Sun Intensity', min=0, max=20, value=self._directional_light_intensity)
+
+        if not include_static_shadow_controls:
+            # Initialize sun position with current time.
+            self._update_sun_from_hours(current_hours)
+            return
 
         def on_static_shadow_resolution_changed(value=None):
             if self._syncing_static_shadow_ui or self._static_shadow_resolution_combo is None:

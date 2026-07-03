@@ -833,7 +833,11 @@ struct Scene {
         return sample_depth_texture_sun_visibility(shadow_position);
     }
 
-    float4 sample_directional_light(ShadingData sd, float2 rand_sample)
+    float4 sample_directional_light_with_visibility(
+        ShadingData sd,
+        float2 rand_sample,
+        float visibility_override,
+        uint use_visibility_override)
     {
         // Sample direction within sun disk cone
         float4 sample_result = sample_cone_direction(
@@ -845,7 +849,9 @@ struct Scene {
         float pdf = sample_result.w;
         
         // Visibility test
-        float visibility = sample_static_sun_visibility(sd, L_dir);
+        float visibility = use_visibility_override != 0
+            ? saturate(visibility_override)
+            : sample_static_sun_visibility(sd, L_dir);
         
         // Lambertian BRDF evaluation
         float NdotL = max(0.0, dot(sd.shading_frame.n, L_dir));
@@ -863,6 +869,11 @@ struct Scene {
         float3 radiance = visibility * f * illuminance * NdotL;
         
         return float4(radiance, pdf);
+    }
+
+    float4 sample_directional_light(ShadingData sd, float2 rand_sample)
+    {
+        return sample_directional_light_with_visibility(sd, rand_sample, 1.0, 0);
     }
 
     float3 get_sun_transmittance_at_view()
