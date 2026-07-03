@@ -1,0 +1,43 @@
+{
+  "scene": "E:\\GitHub\\niagara_bistro\\bistro.gltf",
+  "width": 64,
+  "height": 64,
+  "frames": 1,
+  "shadow_resolution": 64,
+  "diff_preview_scale": 8.0,
+  "reference_mode": "depth",
+  "renders": [
+    {
+      "mode": "depth",
+      "mode_value": 1,
+      "output": "static_shadow_compare_bistro_64\\00_depth.png",
+      "seconds": 16.54183050012216
+    },
+    {
+      "mode": "compact-pcf",
+      "mode_value": 5,
+      "output": "static_shadow_compare_bistro_64\\01_compact-pcf.png",
+      "seconds": 14.899766399990767
+    }
+  ],
+  "comparisons": [
+    {
+      "reference_mode": "depth",
+      "candidate_mode": "compact-pcf",
+      "diff_preview": "static_shadow_compare_bistro_64\\diff_depth_vs_compact-pcf.png",
+      "diff_preview_scale": 8.0,
+      "metrics": {
+        "mean_abs": 0.0005524280131794512,
+        "mean_abs_percent": 0.05524280294775963,
+        "rmse": 0.005309711231182713,
+        "rmse_percent": 0.5309711231182712,
+        "max_abs": 0.13333332538604736,
+        "max_abs_percent": 13.333332061767578,
+        "changed_pixel_percent": 1.708984375,
+        "psnr_db": 45.49858194791511,
+        "reference_mean": 0.21826206147670746,
+        "candidate_mean": 0.21799492835998535
+      }
+    }
+  ]
+}

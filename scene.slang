@@ -16,16 +16,49 @@ struct DirectionalLight {
     }
 };
 
+struct SSTNode {
+    uint flags;
+    uint child_base;
+    uint meta;
+    uint reserved;
+    float plane_a;
+    float plane_b;
+    float plane_c;
+    float max_error;
+};
+
 struct StaticShadowDepthMapData {
     Texture2D<float> depth_texture;
+    Texture2D<float> sst_decompressed_texture;
     SamplerState depth_sampler;
+    StructuredBuffer<SSTNode> sst_nodes;
+    StructuredBuffer<uint2> sst_packed_nodes;
+    StructuredBuffer<uint> sst_compact_words;
+    StructuredBuffer<uint> sst_tile_roots;
+    StructuredBuffer<uint> sst_compact_roots;
     float4x4 world_to_shadow;
     uint enabled;
     uint resolution;
     float depth_bias;
+    uint shadow_mode;
+    uint sst_enabled;
+    uint sst_tile_size;
+    uint2 sst_tile_grid;
+    uint sst_node_count;
+    uint sst_max_traversal_steps;
+    uint sst_compact_word_count;
+    uint sst_branch_10bit_start_level;
     uint pad0;
-    uint pad1;
 };
+
+static const uint SHADOW_MODE_REALTIME = 0;
+static const uint SHADOW_MODE_DEPTH_TEXTURE = 1;
+static const uint SHADOW_MODE_SST = 2;
+static const uint SHADOW_MODE_PACKED_SST = 3;
+static const uint SHADOW_MODE_COMPACT_SST = 4;
+static const uint SHADOW_MODE_COMPACT_SST_PCF3 = 5;
+static const uint SHADOW_MODE_DECOMPRESSED_SST = 6;
+static const uint SST_NODE_FLAG_PLANE = 1 << 0;
 
 // Sky atmosphere constants (from atmosphere.slang)
 static const float groundRadiusMM = 6.360;
@@ -391,22 +424,8 @@ struct Scene {
     
     // Sample directional light with NEE (Next Event Estimation)
     // Returns: xyz = radiance contribution, w = pdf
-    float sample_static_sun_visibility(ShadingData sd, float3 light_dir)
+    float sample_depth_texture_sun_visibility(float3 shadow_position)
     {
-        Ray shadow_ray = Ray(sd.compute_new_ray_origin(), light_dir);
-        if (static_shadow.enabled == 0)
-            return get_visibility(shadow_ray);
-
-        float4 shadow_position_h = mul(static_shadow.world_to_shadow, float4(shadow_ray.origin, 1.0));
-        float3 shadow_position = shadow_position_h.xyz / max(abs(shadow_position_h.w), 1e-6);
-
-        if (shadow_position.x < 0.0 || shadow_position.x > 1.0 ||
-            shadow_position.y < 0.0 || shadow_position.y > 1.0 ||
-            shadow_position.z < 0.0 || shadow_position.z > 1.0)
-        {
-            return get_visibility(shadow_ray);
-        }
-
         float2 texel_size = 1.0 / float2(max(static_shadow.resolution, 1));
         float visibility = 0.0;
         [unroll]
@@ -426,6 +445,392 @@ struct Scene {
         }
 
         return visibility / 9.0;
+    }
+
+    float sample_decompressed_sst_sun_visibility(float3 shadow_position)
+    {
+        if (static_shadow.sst_enabled == 0)
+            return sample_depth_texture_sun_visibility(shadow_position);
+
+        float2 texel_size = 1.0 / float2(max(static_shadow.resolution, 1));
+        float visibility = 0.0;
+        [unroll]
+        for (int y = -1; y <= 1; y++)
+        {
+            [unroll]
+            for (int x = -1; x <= 1; x++)
+            {
+                float2 sample_uv = clamp(
+                    shadow_position.xy + float2(x, y) * texel_size,
+                    float2(0.0),
+                    float2(1.0)
+                );
+                float baked_depth = static_shadow.sst_decompressed_texture.SampleLevel(static_shadow.depth_sampler, sample_uv, 0);
+                visibility += (shadow_position.z <= baked_depth + static_shadow.depth_bias) ? 1.0 : 0.0;
+            }
+        }
+
+        return visibility / 9.0;
+    }
+
+    float sample_sst_sun_visibility(float3 shadow_position)
+    {
+        if (static_shadow.sst_enabled == 0 ||
+            static_shadow.sst_node_count == 0 ||
+            static_shadow.sst_tile_size == 0 ||
+            static_shadow.sst_tile_grid.x == 0 ||
+            static_shadow.sst_tile_grid.y == 0)
+        {
+            return sample_packed_sst_sun_visibility(shadow_position);
+        }
+
+        uint resolution = max(static_shadow.resolution, 1);
+        uint pixel_x = min((uint)(shadow_position.x * float(resolution)), resolution - 1);
+        uint pixel_y = min((uint)(shadow_position.y * float(resolution)), resolution - 1);
+        uint tile_x = min(pixel_x / static_shadow.sst_tile_size, static_shadow.sst_tile_grid.x - 1);
+        uint tile_y = min(pixel_y / static_shadow.sst_tile_size, static_shadow.sst_tile_grid.y - 1);
+        uint root_index = static_shadow.sst_tile_roots[tile_y * static_shadow.sst_tile_grid.x + tile_x];
+        if (root_index >= static_shadow.sst_node_count)
+            return sample_depth_texture_sun_visibility(shadow_position);
+
+        uint tile_origin_x = tile_x * static_shadow.sst_tile_size;
+        uint tile_origin_y = tile_y * static_shadow.sst_tile_size;
+        uint tile_extent_x = max(min(static_shadow.sst_tile_size, resolution - tile_origin_x), 1);
+        uint tile_extent_y = max(min(static_shadow.sst_tile_size, resolution - tile_origin_y), 1);
+        float local_x = ((float(pixel_x) + 0.5) - float(tile_origin_x)) / float(tile_extent_x);
+        float local_y = ((float(pixel_y) + 0.5) - float(tile_origin_y)) / float(tile_extent_y);
+        uint tree_bits = is_power_of_two_uint(static_shadow.sst_tile_size) ? log2_power_of_two_uint(static_shadow.sst_tile_size) : 0;
+
+        uint node_index = root_index;
+        uint max_steps = min(max(static_shadow.sst_max_traversal_steps, 1), 32);
+        [loop]
+        for (uint i = 0; i < max_steps; i++)
+        {
+            if (node_index >= static_shadow.sst_node_count)
+                return sample_depth_texture_sun_visibility(shadow_position);
+
+            SSTNode node = static_shadow.sst_nodes[node_index];
+            if ((node.flags & SST_NODE_FLAG_PLANE) != 0)
+            {
+                float encoded_depth = saturate(
+                    node.plane_a * (local_x - 0.5) +
+                    node.plane_b * (local_y - 0.5) +
+                    node.plane_c
+                );
+                return (shadow_position.z <= encoded_depth + static_shadow.depth_bias) ? 1.0 : 0.0;
+            }
+
+            uint quadrant = decode_tile_morton_quadrant(
+                pixel_x,
+                pixel_y,
+                tile_origin_x,
+                tile_origin_y,
+                tile_extent_x,
+                tile_extent_y,
+                local_x,
+                local_y,
+                tree_bits,
+                i
+            );
+            node_index = node.child_base + quadrant;
+            local_x = local_x * 2.0 - ((quadrant & 1) != 0 ? 1.0 : 0.0);
+            local_y = local_y * 2.0 - ((quadrant & 2) != 0 ? 1.0 : 0.0);
+        }
+
+        return sample_depth_texture_sun_visibility(shadow_position);
+    }
+
+    float decode_unorm_bits(uint value, uint max_value)
+    {
+        return float(value) / float(max_value);
+    }
+
+    float decode_snorm_bits(uint value, uint max_value, float value_range)
+    {
+        return ((float(value) / float(max_value)) * 2.0 - 1.0) * value_range;
+    }
+
+    uint decode_packed_branch_offset(uint word0, uint word1, uint level, uint quadrant)
+    {
+        if (level >= static_shadow.sst_branch_10bit_start_level)
+        {
+            if (quadrant == 0)
+                return (word0 >> 2) & 0x3ff;
+            if (quadrant == 1)
+                return (word0 >> 12) & 0x3ff;
+            if (quadrant == 2)
+                return (word0 >> 22) & 0x3ff;
+            return word1 & 0x3ff;
+        }
+
+        if (quadrant == 0)
+            return (word0 >> 2) & 0x1fff;
+        if (quadrant == 1)
+            return (word0 >> 15) & 0x1fff;
+        if (quadrant == 2)
+            return ((word0 >> 28) & 0xf) | ((word1 & 0x1ff) << 4);
+        return (word1 >> 9) & 0x1fff;
+    }
+
+    bool is_power_of_two_uint(uint value)
+    {
+        return value != 0 && (value & (value - 1)) == 0;
+    }
+
+    uint log2_power_of_two_uint(uint value)
+    {
+        uint bits = 0;
+        [loop]
+        for (uint i = 0; i < 16; i++)
+        {
+            if (value <= 1)
+                break;
+            value >>= 1;
+            bits++;
+        }
+        return bits;
+    }
+
+    uint decode_tile_morton_quadrant(
+        uint pixel_x,
+        uint pixel_y,
+        uint tile_origin_x,
+        uint tile_origin_y,
+        uint tile_extent_x,
+        uint tile_extent_y,
+        float local_x,
+        float local_y,
+        uint tree_bits,
+        uint level)
+    {
+        uint fallback_quadrant = (local_x >= 0.5 ? 1 : 0) + (local_y >= 0.5 ? 2 : 0);
+        uint tile_size = static_shadow.sst_tile_size;
+        if (tree_bits == 0 || tile_extent_x != tile_size || tile_extent_y != tile_size)
+            return fallback_quadrant;
+
+        if (level >= tree_bits)
+            return fallback_quadrant;
+
+        uint bit_index = tree_bits - 1 - level;
+        uint local_pixel_x = min(pixel_x - tile_origin_x, tile_size - 1);
+        uint local_pixel_y = min(pixel_y - tile_origin_y, tile_size - 1);
+        return ((local_pixel_x >> bit_index) & 1) | (((local_pixel_y >> bit_index) & 1) << 1);
+    }
+
+    float sample_packed_sst_sun_visibility(float3 shadow_position)
+    {
+        if (static_shadow.sst_enabled == 0 ||
+            static_shadow.sst_node_count == 0 ||
+            static_shadow.sst_tile_size == 0 ||
+            static_shadow.sst_tile_grid.x == 0 ||
+            static_shadow.sst_tile_grid.y == 0)
+        {
+            return sample_depth_texture_sun_visibility(shadow_position);
+        }
+
+        uint resolution = max(static_shadow.resolution, 1);
+        uint pixel_x = min((uint)(shadow_position.x * float(resolution)), resolution - 1);
+        uint pixel_y = min((uint)(shadow_position.y * float(resolution)), resolution - 1);
+        uint tile_x = min(pixel_x / static_shadow.sst_tile_size, static_shadow.sst_tile_grid.x - 1);
+        uint tile_y = min(pixel_y / static_shadow.sst_tile_size, static_shadow.sst_tile_grid.y - 1);
+        uint root_index = static_shadow.sst_tile_roots[tile_y * static_shadow.sst_tile_grid.x + tile_x];
+        if (root_index >= static_shadow.sst_node_count)
+            return sample_depth_texture_sun_visibility(shadow_position);
+
+        uint tile_origin_x = tile_x * static_shadow.sst_tile_size;
+        uint tile_origin_y = tile_y * static_shadow.sst_tile_size;
+        uint tile_extent_x = max(min(static_shadow.sst_tile_size, resolution - tile_origin_x), 1);
+        uint tile_extent_y = max(min(static_shadow.sst_tile_size, resolution - tile_origin_y), 1);
+        float local_x = ((float(pixel_x) + 0.5) - float(tile_origin_x)) / float(tile_extent_x);
+        float local_y = ((float(pixel_y) + 0.5) - float(tile_origin_y)) / float(tile_extent_y);
+        uint tree_bits = is_power_of_two_uint(static_shadow.sst_tile_size) ? log2_power_of_two_uint(static_shadow.sst_tile_size) : 0;
+
+        uint node_index = root_index;
+        uint max_steps = min(max(static_shadow.sst_max_traversal_steps, 1), 32);
+        [loop]
+        for (uint i = 0; i < max_steps; i++)
+        {
+            if (node_index >= static_shadow.sst_node_count)
+                return sample_depth_texture_sun_visibility(shadow_position);
+
+            uint2 packed_node = static_shadow.sst_packed_nodes[node_index];
+            uint control = packed_node.x & 0x3;
+            if (control == 1)
+            {
+                float encoded_depth = decode_unorm_bits((packed_node.x >> 2) & 0x3fffffff, 0x3fffffff);
+                return (shadow_position.z <= encoded_depth + static_shadow.depth_bias) ? 1.0 : 0.0;
+            }
+            if (control == 2)
+            {
+                uint qz = (packed_node.x >> 2) & 0x3fffffff;
+                uint qx = packed_node.y & 0xffff;
+                uint qy = (packed_node.y >> 16) & 0xffff;
+                float a = decode_snorm_bits(qx, 0xffff, 2.0);
+                float b = decode_snorm_bits(qy, 0xffff, 2.0);
+                float c = decode_unorm_bits(qz, 0x3fffffff);
+                float encoded_depth = saturate(a * (local_x - 0.5) + b * (local_y - 0.5) + c);
+                return (shadow_position.z <= encoded_depth + static_shadow.depth_bias) ? 1.0 : 0.0;
+            }
+
+            uint quadrant = decode_tile_morton_quadrant(
+                pixel_x,
+                pixel_y,
+                tile_origin_x,
+                tile_origin_y,
+                tile_extent_x,
+                tile_extent_y,
+                local_x,
+                local_y,
+                tree_bits,
+                i
+            );
+            uint relative_offset = decode_packed_branch_offset(packed_node.x, packed_node.y, i, quadrant);
+            if (relative_offset == 0)
+                return sample_depth_texture_sun_visibility(shadow_position);
+            node_index += relative_offset;
+            local_x = local_x * 2.0 - ((quadrant & 1) != 0 ? 1.0 : 0.0);
+            local_y = local_y * 2.0 - ((quadrant & 2) != 0 ? 1.0 : 0.0);
+        }
+
+        return sample_depth_texture_sun_visibility(shadow_position);
+    }
+
+    float sample_compact_sst_sun_visibility(float3 shadow_position)
+    {
+        if (static_shadow.sst_enabled == 0 ||
+            static_shadow.sst_compact_word_count == 0 ||
+            static_shadow.sst_tile_size == 0 ||
+            static_shadow.sst_tile_grid.x == 0 ||
+            static_shadow.sst_tile_grid.y == 0)
+        {
+            return sample_depth_texture_sun_visibility(shadow_position);
+        }
+
+        uint resolution = max(static_shadow.resolution, 1);
+        uint pixel_x = min((uint)(shadow_position.x * float(resolution)), resolution - 1);
+        uint pixel_y = min((uint)(shadow_position.y * float(resolution)), resolution - 1);
+        uint tile_x = min(pixel_x / static_shadow.sst_tile_size, static_shadow.sst_tile_grid.x - 1);
+        uint tile_y = min(pixel_y / static_shadow.sst_tile_size, static_shadow.sst_tile_grid.y - 1);
+        uint node_word_offset = static_shadow.sst_compact_roots[tile_y * static_shadow.sst_tile_grid.x + tile_x];
+        if (node_word_offset >= static_shadow.sst_compact_word_count)
+            return sample_packed_sst_sun_visibility(shadow_position);
+
+        uint tile_origin_x = tile_x * static_shadow.sst_tile_size;
+        uint tile_origin_y = tile_y * static_shadow.sst_tile_size;
+        uint tile_extent_x = max(min(static_shadow.sst_tile_size, resolution - tile_origin_x), 1);
+        uint tile_extent_y = max(min(static_shadow.sst_tile_size, resolution - tile_origin_y), 1);
+        float local_x = ((float(pixel_x) + 0.5) - float(tile_origin_x)) / float(tile_extent_x);
+        float local_y = ((float(pixel_y) + 0.5) - float(tile_origin_y)) / float(tile_extent_y);
+        uint tree_bits = is_power_of_two_uint(static_shadow.sst_tile_size) ? log2_power_of_two_uint(static_shadow.sst_tile_size) : 0;
+
+        uint max_steps = min(max(static_shadow.sst_max_traversal_steps, 1), 32);
+        [loop]
+        for (uint i = 0; i < max_steps; i++)
+        {
+            if (node_word_offset >= static_shadow.sst_compact_word_count)
+                return sample_packed_sst_sun_visibility(shadow_position);
+
+            uint word0 = static_shadow.sst_compact_words[node_word_offset];
+            uint control = word0 & 0x3;
+            if (control == 1)
+            {
+                float encoded_depth = decode_unorm_bits((word0 >> 2) & 0x3fffffff, 0x3fffffff);
+                return (shadow_position.z <= encoded_depth + static_shadow.depth_bias) ? 1.0 : 0.0;
+            }
+
+            if (node_word_offset + 1 >= static_shadow.sst_compact_word_count)
+                return sample_packed_sst_sun_visibility(shadow_position);
+
+            uint word1 = static_shadow.sst_compact_words[node_word_offset + 1];
+            if (control == 2)
+            {
+                uint qz = (word0 >> 2) & 0x3fffffff;
+                uint qx = word1 & 0xffff;
+                uint qy = (word1 >> 16) & 0xffff;
+                float a = decode_snorm_bits(qx, 0xffff, 2.0);
+                float b = decode_snorm_bits(qy, 0xffff, 2.0);
+                float c = decode_unorm_bits(qz, 0x3fffffff);
+                float encoded_depth = saturate(a * (local_x - 0.5) + b * (local_y - 0.5) + c);
+                return (shadow_position.z <= encoded_depth + static_shadow.depth_bias) ? 1.0 : 0.0;
+            }
+
+            uint quadrant = decode_tile_morton_quadrant(
+                pixel_x,
+                pixel_y,
+                tile_origin_x,
+                tile_origin_y,
+                tile_extent_x,
+                tile_extent_y,
+                local_x,
+                local_y,
+                tree_bits,
+                i
+            );
+            uint relative_offset = decode_packed_branch_offset(word0, word1, i, quadrant);
+            if (relative_offset == 0)
+                return sample_packed_sst_sun_visibility(shadow_position);
+            node_word_offset += relative_offset;
+            local_x = local_x * 2.0 - ((quadrant & 1) != 0 ? 1.0 : 0.0);
+            local_y = local_y * 2.0 - ((quadrant & 2) != 0 ? 1.0 : 0.0);
+        }
+
+        return sample_packed_sst_sun_visibility(shadow_position);
+    }
+
+    float sample_compact_sst_sun_visibility_pcf3(float3 shadow_position)
+    {
+        float2 texel_size = 1.0 / float2(max(static_shadow.resolution, 1));
+        float visibility = 0.0;
+        [unroll]
+        for (int y = -1; y <= 1; y++)
+        {
+            [unroll]
+            for (int x = -1; x <= 1; x++)
+            {
+                float3 sample_position = shadow_position;
+                sample_position.xy = clamp(
+                    shadow_position.xy + float2(x, y) * texel_size,
+                    float2(0.0),
+                    float2(1.0)
+                );
+                visibility += sample_compact_sst_sun_visibility(sample_position);
+            }
+        }
+        return visibility / 9.0;
+    }
+
+    float sample_static_sun_visibility(ShadingData sd, float3 light_dir)
+    {
+        Ray shadow_ray = Ray(sd.compute_new_ray_origin(), light_dir);
+        if (static_shadow.enabled == 0 || static_shadow.shadow_mode == SHADOW_MODE_REALTIME)
+            return get_visibility(shadow_ray);
+
+        float4 shadow_position_h = mul(static_shadow.world_to_shadow, float4(shadow_ray.origin, 1.0));
+        float3 shadow_position = shadow_position_h.xyz / max(abs(shadow_position_h.w), 1e-6);
+
+        if (shadow_position.x < 0.0 || shadow_position.x > 1.0 ||
+            shadow_position.y < 0.0 || shadow_position.y > 1.0 ||
+            shadow_position.z < 0.0 || shadow_position.z > 1.0)
+        {
+            return get_visibility(shadow_ray);
+        }
+
+        if (static_shadow.shadow_mode == SHADOW_MODE_DECOMPRESSED_SST)
+            return sample_decompressed_sst_sun_visibility(shadow_position);
+
+        if (static_shadow.shadow_mode == SHADOW_MODE_COMPACT_SST_PCF3)
+            return sample_compact_sst_sun_visibility_pcf3(shadow_position);
+
+        if (static_shadow.shadow_mode == SHADOW_MODE_COMPACT_SST)
+            return sample_compact_sst_sun_visibility(shadow_position);
+
+        if (static_shadow.shadow_mode == SHADOW_MODE_PACKED_SST)
+            return sample_packed_sst_sun_visibility(shadow_position);
+
+        if (static_shadow.shadow_mode == SHADOW_MODE_SST)
+            return sample_sst_sun_visibility(shadow_position);
+
+        return sample_depth_texture_sun_visibility(shadow_position);
     }
 
     float4 sample_directional_light(ShadingData sd, float2 rand_sample)

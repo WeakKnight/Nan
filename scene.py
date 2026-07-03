@@ -24,9 +24,27 @@ from atmosphere import AtmosphereTransmittanceLUT, AtmosphereMultiScatteringLUT,
 from sun_position import SunPosition, SunPositionData
 from texture_manager import TextureManager, TextureType, TextureRecord
 from static_shadow_depth_map import StaticShadowDepthMap
+from sparse_shadow_tree import SparseShadowTreeEncoder, SparseShadowTreeStats
+from sst_decompress import SSTDecompressor
 
 
 class Scene:
+    SHADOW_MODE_REALTIME = 0
+    SHADOW_MODE_DEPTH_TEXTURE = 1
+    SHADOW_MODE_SST = 2
+    SHADOW_MODE_PACKED_SST = 3
+    SHADOW_MODE_COMPACT_SST = 4
+    SHADOW_MODE_COMPACT_SST_PCF3 = 5
+    SHADOW_MODE_DECOMPRESSED_SST = 6
+    SST_FIT_DUAL_BIAS = 0
+    SST_FIT_DUAL_HALF_VISIBLE = 1
+    SST_FIT_DUAL_VISIBLE = 2
+    SST_FIT_DUAL_RELAXED_VISIBLE = 3
+    SST_FIT_DUAL_LOOSE_VISIBLE = 4
+    SST_PRESET_QUALITY = 0
+    SST_PRESET_HIGH_COMPRESSION = 1
+    SST_PRESET_MANUAL = 2
+
     # Instance flags (must match InstanceFlags in common.slang)
     INSTANCE_FLAG_NONE = 0
     INSTANCE_FLAG_ODD_NEGATIVE_TRANSFORM = 1 << 0
@@ -144,6 +162,7 @@ class Scene:
         self.static_shadow_resolution: int = 2048
         self.static_shadow_depth_bias: float = 0.0015
         self.static_shadow_enabled: bool = False
+        self.static_shadow_mode: int = Scene.SHADOW_MODE_REALTIME
         self.static_shadow_depth_texture: spy.Texture = device.create_texture(
             format=spy.Format.r32_float,
             width=1,
@@ -152,9 +171,73 @@ class Scene:
             label="static_shadow_default_depth",
             data=np.ones((1, 1), dtype=np.float32),
         )
+        self.static_shadow_second_depth_texture: spy.Texture = device.create_texture(
+            format=spy.Format.r32_float,
+            width=1,
+            height=1,
+            usage=spy.TextureUsage.shader_resource,
+            label="static_shadow_default_second_depth",
+            data=np.ones((1, 1), dtype=np.float32),
+        )
         self.static_shadow_world_to_light: spy.float4x4 = spy.float4x4.identity()
         self.static_shadow_baked_sun_direction: tuple[float, float, float] | None = None
         self.static_shadow_baker = StaticShadowDepthMap(device)
+        self.sst_decompressor = SSTDecompressor(device)
+        self.sst_decompressed_depth_texture: spy.Texture = device.create_texture(
+            format=spy.Format.r32_float,
+            width=1,
+            height=1,
+            usage=spy.TextureUsage.shader_resource,
+            label="sst_default_decompressed_depth",
+            data=np.ones((1, 1), dtype=np.float32),
+        )
+        self.sst_fit_profile: int = Scene.SST_FIT_DUAL_VISIBLE
+        self.sst_preset: int = Scene.SST_PRESET_QUALITY
+        self.sst_tile_profile: int = 1  # 0=64, 1=128, 2=256
+        self.sst_min_leaf_size: int = 2
+        self.sst_quantization_search_radius: int = 0
+        self.sst_dual_depth_slack_scale: float = 1.0
+        self.sst_encoder = self._create_sst_encoder_for_profile(self.sst_fit_profile)
+        self.sst_enabled: bool = False
+        self.sst_tile_size: int = self.sst_encoder.tile_size
+        self.sst_tile_grid: tuple[int, int] = (1, 1)
+        self.sst_node_count: int = 1
+        self.sst_max_traversal_steps: int = self.sst_encoder.max_traversal_steps
+        self.sst_compact_word_count: int = 1
+        self.sst_branch_10bit_start_level: int = self.sst_encoder.branch_10bit_start_level
+        self.sst_compact_valid: bool = True
+        self.sst_max_error: float = 0.0
+        self.sst_mean_error: float = 0.0
+        self.sst_compression_ratio: float = 0.0
+        self.sst_stats: SparseShadowTreeStats | None = None
+        # Bistro benchmark winner: Dual Visible, 128x128 tiles, 2x2 min leaves,
+        # compact bit-packed traversal with 3x3 PCF. Keep the lower-level knobs
+        # for headless experiments, but the interactive UI uses this path.
+        self.static_shadow_auto_encode_sst: bool = True
+        self.sst_node_buffer = self._create_sst_node_buffer(
+            SparseShadowTreeEncoder.NODE_STRUCT.pack(1, 0, 0, 0, 0.0, 0.0, 1.0, 0.0),
+            "sst_default_node_buffer",
+        )
+        self.sst_tile_roots_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="sst_default_tile_roots",
+            data=np.array([0], dtype=np.uint32),
+        )
+        self.sst_packed_node_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="sst_default_packed_node_buffer",
+            data=np.array([[1, 0]], dtype=np.uint32),
+        )
+        self.sst_compact_words_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="sst_default_compact_words_buffer",
+            data=np.array([1], dtype=np.uint32),
+        )
+        self.sst_compact_roots_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="sst_default_compact_roots_buffer",
+            data=np.array([0], dtype=np.uint32),
+        )
         
         # Start async location fetch
         # SunPosition.get_current_location_async(self._on_location_received)
@@ -523,6 +606,270 @@ class Scene:
             except AttributeError:
                 pass
 
+    def _sync_shadow_mode_ui(self):
+        pass
+
+    def _create_sst_node_buffer(self, node_bytes: bytes, label: str):
+        return self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label=label,
+            data=np.frombuffer(node_bytes, dtype=np.uint8).copy(),
+        )
+
+    def _sst_fit_profile_name(self, profile: int | None = None) -> str:
+        profile = self.sst_fit_profile if profile is None else profile
+        names = ("Dual Bias", "Dual Half Visible", "Dual Visible", "Dual Relaxed Visible", "Dual Loose Visible")
+        return names[min(max(int(profile), 0), len(names) - 1)]
+
+    def _sst_preset_name(self, preset: int | None = None) -> str:
+        preset = self.sst_preset if preset is None else preset
+        names = ("Quality", "High Compression", "Manual")
+        return names[min(max(int(preset), 0), len(names) - 1)]
+
+    def _sst_tile_size_from_profile(self, profile: int | None = None) -> int:
+        profile = self.sst_tile_profile if profile is None else profile
+        tile_sizes = (64, 128, 256)
+        return tile_sizes[min(max(int(profile), 0), len(tile_sizes) - 1)]
+
+    def _create_sst_encoder_for_profile(self, profile: int) -> SparseShadowTreeEncoder:
+        profile = min(max(int(profile), Scene.SST_FIT_DUAL_BIAS), Scene.SST_FIT_DUAL_LOOSE_VISIBLE)
+        visibility_tolerance = 0.0
+        if profile == Scene.SST_FIT_DUAL_HALF_VISIBLE:
+            visibility_tolerance = self.static_shadow_depth_bias * 0.5
+        elif profile == Scene.SST_FIT_DUAL_VISIBLE:
+            visibility_tolerance = self.static_shadow_depth_bias
+        elif profile == Scene.SST_FIT_DUAL_RELAXED_VISIBLE:
+            visibility_tolerance = self.static_shadow_depth_bias * 2.0
+        elif profile == Scene.SST_FIT_DUAL_LOOSE_VISIBLE:
+            visibility_tolerance = self.static_shadow_depth_bias * 4.0
+
+        return SparseShadowTreeEncoder(
+            tile_size=self._sst_tile_size_from_profile(),
+            min_leaf_size=max(1, int(self.sst_min_leaf_size)),
+            dual_depth_slack=self.static_shadow_depth_bias * max(0.0, float(self.sst_dual_depth_slack_scale)),
+            dual_max_leak=self.static_shadow_depth_bias,
+            dual_visibility_tolerance=visibility_tolerance,
+            shadow_bias=self.static_shadow_depth_bias,
+            plane_quantization_search_radius=max(0, int(self.sst_quantization_search_radius)),
+        )
+
+    def _invalidate_sst_encoding(self):
+        if self.sst_enabled:
+            self.sst_enabled = False
+            self.sst_stats = None
+            if self.static_shadow_mode in (
+                Scene.SHADOW_MODE_SST,
+                Scene.SHADOW_MODE_PACKED_SST,
+                Scene.SHADOW_MODE_COMPACT_SST,
+                Scene.SHADOW_MODE_COMPACT_SST_PCF3,
+                Scene.SHADOW_MODE_DECOMPRESSED_SST,
+            ):
+                self.static_shadow_mode = Scene.SHADOW_MODE_DEPTH_TEXTURE if self.static_shadow_enabled else Scene.SHADOW_MODE_REALTIME
+                self._sync_shadow_mode_ui()
+            self._reset_accumulation()
+
+    def _refresh_sst_encoder(self):
+        self.sst_encoder = self._create_sst_encoder_for_profile(self.sst_fit_profile)
+        self.sst_tile_size = self.sst_encoder.tile_size
+        self.sst_max_traversal_steps = self.sst_encoder.max_traversal_steps
+        self.sst_branch_10bit_start_level = self.sst_encoder.branch_10bit_start_level
+
+    def _sync_sst_option_ui(self):
+        pass
+
+    def _apply_sst_preset(self, preset: int):
+        preset = min(max(int(preset), Scene.SST_PRESET_QUALITY), Scene.SST_PRESET_MANUAL)
+        if preset == Scene.SST_PRESET_MANUAL:
+            if self.sst_preset != Scene.SST_PRESET_MANUAL:
+                self.sst_preset = Scene.SST_PRESET_MANUAL
+                self._sync_sst_option_ui()
+                self._update_static_shadow_status()
+            return
+
+        if preset == Scene.SST_PRESET_HIGH_COMPRESSION:
+            target_profile = Scene.SST_FIT_DUAL_RELAXED_VISIBLE
+        else:
+            target_profile = Scene.SST_FIT_DUAL_VISIBLE
+
+        changed = (
+            self.sst_preset != preset or
+            self.sst_fit_profile != target_profile or
+            self.sst_tile_profile != 1 or
+            self.sst_min_leaf_size != 2 or
+            self.sst_quantization_search_radius != 0 or
+            abs(self.sst_dual_depth_slack_scale - 1.0) > 1e-4
+        )
+        if not changed:
+            return
+
+        self.sst_preset = preset
+        self.sst_fit_profile = target_profile
+        self.sst_tile_profile = 1
+        self.sst_min_leaf_size = 2
+        self.sst_quantization_search_radius = 0
+        self.sst_dual_depth_slack_scale = 1.0
+        self._refresh_sst_encoder()
+        self._invalidate_sst_encoding()
+        self._sync_sst_option_ui()
+        self._update_static_shadow_status()
+
+    def _set_sst_fit_profile(self, profile: int):
+        profile = min(max(int(profile), Scene.SST_FIT_DUAL_BIAS), Scene.SST_FIT_DUAL_LOOSE_VISIBLE)
+        if profile == self.sst_fit_profile:
+            return
+
+        self.sst_preset = Scene.SST_PRESET_MANUAL
+        self.sst_fit_profile = profile
+        self._refresh_sst_encoder()
+        self._invalidate_sst_encoding()
+        self._sync_sst_option_ui()
+        self._update_static_shadow_status()
+
+    def _set_sst_encoder_options(self, tile_profile: int, min_leaf_size: int, quantization_radius: int, dual_slack_scale: float):
+        tile_profile = min(max(int(tile_profile), 0), 2)
+        min_leaf_size = min(max(int(min_leaf_size), 1), 8)
+        quantization_radius = min(max(int(quantization_radius), 0), 2)
+        dual_slack_scale = min(max(float(dual_slack_scale), 0.0), 8.0)
+        if (
+            tile_profile == self.sst_tile_profile and
+            min_leaf_size == self.sst_min_leaf_size and
+            quantization_radius == self.sst_quantization_search_radius and
+            abs(dual_slack_scale - self.sst_dual_depth_slack_scale) < 1e-4
+        ):
+            return
+
+        self.sst_preset = Scene.SST_PRESET_MANUAL
+        self.sst_tile_profile = tile_profile
+        self.sst_min_leaf_size = min_leaf_size
+        self.sst_quantization_search_radius = quantization_radius
+        self.sst_dual_depth_slack_scale = dual_slack_scale
+        self._refresh_sst_encoder()
+        self._invalidate_sst_encoding()
+        self._sync_sst_option_ui()
+        self._update_static_shadow_status()
+
+    def _update_static_shadow_status(self):
+        mode_names = ("Realtime", "Depth Texture", "SST", "Packed SST", "Compact SST", "Compact SST PCF3", "Decompressed SST")
+        mode_name = mode_names[min(max(self.static_shadow_mode, 0), len(mode_names) - 1)]
+        profile_name = self._sst_fit_profile_name()
+        sst_config_text = (
+            f"Tile={self._sst_tile_size_from_profile()} "
+            f"Leaf={self.sst_min_leaf_size} "
+        )
+        if not self.static_shadow_enabled:
+            self._set_static_shadow_status(f"Static shadow: not baked Strategy={profile_name} CompactPCF {sst_config_text}")
+            return
+
+        if self.sst_enabled and self.sst_stats is not None:
+            self._set_static_shadow_status(
+                f"Mode={mode_name} Strategy={profile_name} CompactPCF Depth={self.static_shadow_resolution} "
+                f"{sst_config_text} "
+                f"Tiles={self.sst_stats.tile_count} Nodes={self.sst_stats.node_count} "
+                f"Steps={self.sst_stats.max_traversal_steps} "
+                f"Packed={self.sst_stats.packed_compression_ratio:.2f}x "
+                f"CompactOK={self.sst_stats.packed_decode_valid} "
+                f"Leak>B={self.sst_stats.packed_leak_over_full_bias_percent:.3f}% "
+                f"VisMis={self.sst_stats.packed_visibility_mismatch_percent:.3f}% "
+                f"MeanLoss={self.sst_stats.mean_error_percent:.3f}%"
+            )
+        else:
+            self._set_static_shadow_status(f"Mode={mode_name} Strategy={profile_name} CompactPCF Depth={self.static_shadow_resolution} {sst_config_text} SST=not encoded")
+
+    def encode_sparse_shadow_tree(self):
+        if not self.static_shadow_enabled:
+            print("[Scene] Static shadow depth map must be baked before SST encoding")
+            self._set_static_shadow_status("Static shadow: bake before SST encode")
+            return None
+
+        depth_data = self.static_shadow_depth_texture.to_numpy()
+        depth_data = np.asarray(depth_data, dtype=np.float32).squeeze()
+        if depth_data.ndim != 2:
+            raise RuntimeError(f"Unexpected static shadow depth readback shape: {depth_data.shape}")
+        second_depth_data = self.static_shadow_second_depth_texture.to_numpy()
+        second_depth_data = np.asarray(second_depth_data, dtype=np.float32).squeeze()
+
+        encoded = self.sst_encoder.encode(depth_data, second_depth_data)
+        self.sst_node_buffer = self._create_sst_node_buffer(encoded.nodes, "sst_node_buffer")
+        self.sst_packed_node_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="sst_packed_node_buffer",
+            data=encoded.fixed64_nodes,
+        )
+        self.sst_compact_words_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="sst_compact_words_buffer",
+            data=encoded.compact_words,
+        )
+        self.sst_compact_roots_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="sst_compact_roots_buffer",
+            data=encoded.compact_tile_roots,
+        )
+        self.sst_tile_roots_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="sst_tile_roots_buffer",
+            data=encoded.tile_roots,
+        )
+        self.sst_decompressed_depth_texture = self.device.create_texture(
+            format=spy.Format.r32_float,
+            width=self.static_shadow_resolution,
+            height=self.static_shadow_resolution,
+            usage=spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access,
+            label="sst_decompressed_depth_map",
+        )
+        self.sst_tile_grid = encoded.tile_grid
+        self.sst_tile_size = encoded.tile_size
+        self.sst_node_count = encoded.stats.node_count
+        self.sst_max_traversal_steps = encoded.stats.max_traversal_steps
+        self.sst_compact_valid = encoded.stats.packed_decode_valid
+        self.sst_compact_word_count = int(encoded.compact_words.size) if self.sst_compact_valid else 0
+        self.sst_branch_10bit_start_level = encoded.stats.branch_10bit_start_level
+        self.sst_max_error = encoded.stats.max_error
+        self.sst_mean_error = encoded.stats.mean_error
+        self.sst_compression_ratio = encoded.stats.compression_ratio
+        self.sst_stats = encoded.stats
+        self.sst_enabled = True
+        if self.sst_compact_valid:
+            command_encoder = self.device.create_command_encoder()
+            self.sst_decompressor.execute(
+                command_encoder,
+                self.sst_decompressed_depth_texture,
+                self.sst_compact_words_buffer,
+                self.sst_compact_roots_buffer,
+                self.static_shadow_resolution,
+                self.sst_tile_grid,
+                self.sst_tile_size,
+                self.sst_max_traversal_steps,
+                self.sst_compact_word_count,
+                self.sst_branch_10bit_start_level,
+            )
+            self.device.submit_command_buffer(command_encoder.finish())
+        if self.sst_compact_valid:
+            self.static_shadow_mode = Scene.SHADOW_MODE_COMPACT_SST_PCF3
+        else:
+            self.static_shadow_mode = Scene.SHADOW_MODE_DEPTH_TEXTURE
+        self._update_static_shadow_status()
+        self._reset_accumulation()
+        print(
+            "[Scene] SST encoded: "
+            f"profile={self._sst_fit_profile_name()}, "
+            f"tile={self.sst_tile_size}, leaf={self.sst_min_leaf_size}, "
+            f"qRadius={self.sst_quantization_search_radius}, slack={self.sst_dual_depth_slack_scale:.2f}B, "
+            f"tiles={encoded.stats.tile_count}, nodes={encoded.stats.node_count}, "
+            f"ratio={encoded.stats.compression_ratio:.2f}x, "
+            f"mean_loss={encoded.stats.mean_error_percent:.4f}%, "
+            f"max_loss={encoded.stats.max_error_percent:.4f}%, "
+            f"rmse={encoded.stats.rmse_error_percent:.4f}%, "
+            f"leak_pixels={encoded.stats.leak_pixel_percent:.4f}%, "
+            f"leak_gt_bias={encoded.stats.packed_leak_over_full_bias_percent:.4f}%, "
+            f"vis_mismatch={encoded.stats.packed_visibility_mismatch_percent:.4f}%, "
+            f"packed_ratio={encoded.stats.packed_compression_ratio:.2f}x, "
+            f"compact_valid={encoded.stats.packed_decode_valid}, "
+            f"decompressed={'yes' if self.sst_compact_valid else 'no'}, "
+            f"steps={encoded.stats.max_traversal_steps}"
+        )
+        return encoded.stats
+
     def bake_static_shadow_depth_map(self):
         self.static_shadow_world_to_light, shadow_to_world = self._make_static_shadow_matrices()
         shadow_depth_texture = self.device.create_texture(
@@ -532,26 +879,41 @@ class Scene:
             usage=spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access,
             label="static_shadow_depth_map",
         )
+        shadow_second_depth_texture = self.device.create_texture(
+            format=spy.Format.r32_float,
+            width=self.static_shadow_resolution,
+            height=self.static_shadow_resolution,
+            usage=spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access,
+            label="static_shadow_second_depth_map",
+        )
 
         command_encoder = self.device.create_command_encoder()
         self.static_shadow_baker.execute(
             command_encoder,
             self,
             shadow_depth_texture,
+            shadow_second_depth_texture,
             shadow_to_world,
         )
         self.device.submit_command_buffer(command_encoder.finish())
 
         self.static_shadow_depth_texture = shadow_depth_texture
+        self.static_shadow_second_depth_texture = shadow_second_depth_texture
         self.static_shadow_enabled = True
+        self.static_shadow_mode = Scene.SHADOW_MODE_DEPTH_TEXTURE
         self.static_shadow_baked_sun_direction = (
             float(self._sun_direction[0]),
             float(self._sun_direction[1]),
             float(self._sun_direction[2]),
         )
-        self._set_static_shadow_status(f"Static shadow baked: {self.static_shadow_resolution}x{self.static_shadow_resolution}")
+        self.sst_enabled = False
+        self.sst_stats = None
+        self._sync_shadow_mode_ui()
+        self._update_static_shadow_status()
         self._reset_accumulation()
         print(f"[Scene] Static shadow depth map baked at {self.static_shadow_resolution}x{self.static_shadow_resolution}")
+        if self.static_shadow_auto_encode_sst:
+            self.encode_sparse_shadow_tree()
 
     def _generate_static_atmosphere_luts(self):
         """Generate transmittance and multi-scattering LUTs (only needed once)."""
@@ -726,7 +1088,7 @@ class Scene:
         # Update directional light intensity from slider if present
         if self._intensity_slider is not None:
             self._directional_light_intensity = self._intensity_slider.value
-        
+
         if self._sun_direction_dirty:
             self._generate_sky_view_lut()
     
@@ -796,6 +1158,10 @@ class Scene:
             self._sun_direction_dirty = True
             if self.static_shadow_enabled:
                 self.static_shadow_enabled = False
+                self.sst_enabled = False
+                self.sst_stats = None
+                self.static_shadow_mode = Scene.SHADOW_MODE_REALTIME
+                self._sync_shadow_mode_ui()
                 self._set_static_shadow_status('Static shadow: sun changed, rebake needed')
                 self._reset_accumulation()
 
@@ -816,11 +1182,25 @@ class Scene:
         cursor["instance_count"] = len(self.instance_descs)
         cursor["frame_index"] = self._frame_index
         cursor["static_shadow"]["depth_texture"] = self.static_shadow_depth_texture
+        cursor["static_shadow"]["sst_decompressed_texture"] = self.sst_decompressed_depth_texture
         cursor["static_shadow"]["depth_sampler"] = self.static_shadow_sampler
         cursor["static_shadow"]["world_to_shadow"] = self.static_shadow_world_to_light
         cursor["static_shadow"]["enabled"] = 1 if self.static_shadow_enabled else 0
         cursor["static_shadow"]["resolution"] = self.static_shadow_resolution
         cursor["static_shadow"]["depth_bias"] = self.static_shadow_depth_bias
+        cursor["static_shadow"]["shadow_mode"] = self.static_shadow_mode
+        cursor["static_shadow"]["sst_enabled"] = 1 if self.sst_enabled else 0
+        cursor["static_shadow"]["sst_tile_size"] = self.sst_tile_size
+        cursor["static_shadow"]["sst_tile_grid"] = spy.uint2(self.sst_tile_grid[0], self.sst_tile_grid[1])
+        cursor["static_shadow"]["sst_node_count"] = self.sst_node_count
+        cursor["static_shadow"]["sst_max_traversal_steps"] = self.sst_max_traversal_steps
+        cursor["static_shadow"]["sst_compact_word_count"] = self.sst_compact_word_count
+        cursor["static_shadow"]["sst_branch_10bit_start_level"] = self.sst_branch_10bit_start_level
+        cursor["static_shadow"]["sst_nodes"] = self.sst_node_buffer
+        cursor["static_shadow"]["sst_packed_nodes"] = self.sst_packed_node_buffer
+        cursor["static_shadow"]["sst_compact_words"] = self.sst_compact_words_buffer
+        cursor["static_shadow"]["sst_tile_roots"] = self.sst_tile_roots_buffer
+        cursor["static_shadow"]["sst_compact_roots"] = self.sst_compact_roots_buffer
         
         # Bind directional light parameters
         # Direction is same as sun_direction (pointing toward the sun)

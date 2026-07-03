@@ -33,6 +33,8 @@ class AppConfig:
     srgb_output: bool = True
     camera_move_test: bool = False
     scene_path: str | None = None
+    static_shadow_mode: int | None = None
+    static_shadow_resolution: int | None = None
 
 class App:
     def __init__(self, config: Optional[AppConfig] = None):
@@ -116,7 +118,7 @@ class App:
         self.renderer.initialize(self.device, self.scene)
         if self.ui is not None:
             ui_window = spy.ui.Window(
-                self.ui.screen, "Settings", spy.float2(10, 10), spy.float2(360, 180)
+                self.ui.screen, "Settings", spy.float2(10, 10), spy.float2(420, 300)
             )
 
             # def render_doc_capture_btn():
@@ -168,11 +170,77 @@ class App:
             self.surface.unconfigure()
 
     def main_loop(self):
+        self._configure_static_shadow_if_requested()
         if self.headless:
             self._headless_loop()
         else:
             self._interactive_loop()
         self.device.wait()
+
+    def _configure_static_shadow_if_requested(self) -> None:
+        if self.config.static_shadow_mode is None:
+            return
+
+        self.configure_static_shadow_mode(
+            self.config.static_shadow_mode,
+            self.config.static_shadow_resolution,
+        )
+
+    def configure_static_shadow_mode(self, requested_mode: int, resolution: int | None = None) -> None:
+        requested_mode = max(Scene.SHADOW_MODE_REALTIME, min(Scene.SHADOW_MODE_DECOMPRESSED_SST, int(requested_mode)))
+        if resolution is not None:
+            self.scene.static_shadow_resolution = max(1, int(resolution))
+        if requested_mode == Scene.SHADOW_MODE_REALTIME:
+            self.scene.static_shadow_mode = Scene.SHADOW_MODE_REALTIME
+            return
+
+        needs_sst = requested_mode in (
+            Scene.SHADOW_MODE_SST,
+            Scene.SHADOW_MODE_PACKED_SST,
+            Scene.SHADOW_MODE_COMPACT_SST,
+            Scene.SHADOW_MODE_COMPACT_SST_PCF3,
+            Scene.SHADOW_MODE_DECOMPRESSED_SST,
+        )
+        self.scene.static_shadow_auto_encode_sst = needs_sst
+
+        print(
+            "[App] Baking static shadow before render: "
+            f"mode={requested_mode} resolution={self.scene.static_shadow_resolution}"
+        )
+        self.scene.bake_static_shadow_depth_map()
+        if needs_sst and not self.scene.sst_enabled:
+            self.scene.encode_sparse_shadow_tree()
+
+        if needs_sst and not self.scene.sst_enabled:
+            print("[App] Requested SST shadow mode but SST encode failed; falling back to depth texture")
+            requested_mode = Scene.SHADOW_MODE_DEPTH_TEXTURE
+
+        self.scene.static_shadow_mode = requested_mode
+        self.scene._sync_shadow_mode_ui()
+        self.scene._update_static_shadow_status()
+
+    def render_headless_to_file(self, output_path: Path, frame_count: int | None = None) -> None:
+        if not self.headless:
+            raise RuntimeError("render_headless_to_file requires a headless App")
+
+        self.config.headless_output = Path(output_path)
+        if frame_count is not None:
+            self.config.headless_frame_count = max(1, int(frame_count))
+        self.render_data.clear()
+        self._reset_headless_temporal_state()
+        if self.renderer is not None and hasattr(self.renderer, "reset_accumulator"):
+            self.renderer.reset_accumulator = True
+        self._headless_loop()
+
+    def _reset_headless_temporal_state(self) -> None:
+        self.scene._frame_index = 0
+        camera = self.scene.camera
+        camera.frame_index = 0
+        camera.sample_pattern.current_sample = 0
+        camera.jitter = spy.float2(0, 0)
+        camera.prev_jitter = spy.float2(0, 0)
+        camera._has_prev_matrices = False
+        camera.recompute()
 
     def _ensure_output_texture(self, width: int, height: int) -> None:
         if (
