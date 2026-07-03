@@ -14,7 +14,7 @@ class SSTDecompressor:
         output: spy.Texture,
         compact_words: spy.Buffer,
         compact_roots: spy.Buffer,
-        resolution: int,
+        resolution: int | tuple[int, int],
         tile_grid: tuple[int, int],
         tile_size: int,
         max_traversal_steps: int,
@@ -27,7 +27,11 @@ class SSTDecompressor:
             cursor.g_output = output
             cursor.g_sst_compact_words = compact_words
             cursor.g_sst_compact_roots = compact_roots
-            cursor.g_resolution = int(resolution)
+            if isinstance(resolution, (tuple, list)):
+                width, height = int(resolution[0]), int(resolution[1])
+            else:
+                width = height = int(resolution)
+            cursor.g_resolution = spy.uint2(max(1, width), max(1, height))
             cursor.g_tile_grid = spy.uint2(int(tile_grid[0]), int(tile_grid[1]))
             cursor.g_tile_size = int(tile_size)
             cursor.g_max_traversal_steps = int(max_traversal_steps)

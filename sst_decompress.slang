@@ -2,7 +2,7 @@ RWTexture2D<float> g_output;
 StructuredBuffer<uint> g_sst_compact_words;
 StructuredBuffer<uint> g_sst_compact_roots;
 
-uniform uint g_resolution;
+uniform uint2 g_resolution;
 uniform uint2 g_tile_grid;
 uniform uint g_tile_size;
 uniform uint g_max_traversal_steps;
@@ -90,9 +90,9 @@ float decode_compact_sst_depth(uint2 pixel)
     if (g_compact_word_count == 0 || g_tile_size == 0 || g_tile_grid.x == 0 || g_tile_grid.y == 0)
         return 1.0;
 
-    uint resolution = max(g_resolution, 1);
-    uint pixel_x = min(pixel.x, resolution - 1);
-    uint pixel_y = min(pixel.y, resolution - 1);
+    uint2 resolution = max(g_resolution, uint2(1, 1));
+    uint pixel_x = min(pixel.x, resolution.x - 1);
+    uint pixel_y = min(pixel.y, resolution.y - 1);
     uint tile_x = min(pixel_x / g_tile_size, g_tile_grid.x - 1);
     uint tile_y = min(pixel_y / g_tile_size, g_tile_grid.y - 1);
     uint node_word_offset = g_sst_compact_roots[tile_y * g_tile_grid.x + tile_x];
@@ -101,8 +101,8 @@ float decode_compact_sst_depth(uint2 pixel)
 
     uint tile_origin_x = tile_x * g_tile_size;
     uint tile_origin_y = tile_y * g_tile_size;
-    uint tile_extent_x = max(min(g_tile_size, resolution - tile_origin_x), 1);
-    uint tile_extent_y = max(min(g_tile_size, resolution - tile_origin_y), 1);
+    uint tile_extent_x = max(min(g_tile_size, resolution.x - tile_origin_x), 1);
+    uint tile_extent_y = max(min(g_tile_size, resolution.y - tile_origin_y), 1);
     float local_x = ((float(pixel_x) + 0.5) - float(tile_origin_x)) / float(tile_extent_x);
     float local_y = ((float(pixel_y) + 0.5) - float(tile_origin_y)) / float(tile_extent_y);
     uint tree_bits = is_power_of_two_uint(g_tile_size) ? log2_power_of_two_uint(g_tile_size) : 0;

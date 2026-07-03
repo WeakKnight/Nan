@@ -38,7 +38,7 @@ struct StaticShadowDepthMapData {
     StructuredBuffer<uint> sst_compact_roots;
     float4x4 world_to_shadow;
     uint enabled;
-    uint resolution;
+    uint2 resolution;
     float depth_bias;
     uint shadow_mode;
     uint sst_enabled;
@@ -426,7 +426,7 @@ struct Scene {
     // Returns: xyz = radiance contribution, w = pdf
     float sample_depth_texture_sun_visibility(float3 shadow_position)
     {
-        float2 texel_size = 1.0 / float2(max(static_shadow.resolution, 1));
+        float2 texel_size = 1.0 / float2(max(static_shadow.resolution, uint2(1, 1)));
         float visibility = 0.0;
         [unroll]
         for (int y = -1; y <= 1; y++)
@@ -452,7 +452,7 @@ struct Scene {
         if (static_shadow.sst_enabled == 0)
             return sample_depth_texture_sun_visibility(shadow_position);
 
-        float2 texel_size = 1.0 / float2(max(static_shadow.resolution, 1));
+        float2 texel_size = 1.0 / float2(max(static_shadow.resolution, uint2(1, 1)));
         float visibility = 0.0;
         [unroll]
         for (int y = -1; y <= 1; y++)
@@ -484,9 +484,9 @@ struct Scene {
             return sample_packed_sst_sun_visibility(shadow_position);
         }
 
-        uint resolution = max(static_shadow.resolution, 1);
-        uint pixel_x = min((uint)(shadow_position.x * float(resolution)), resolution - 1);
-        uint pixel_y = min((uint)(shadow_position.y * float(resolution)), resolution - 1);
+        uint2 resolution = max(static_shadow.resolution, uint2(1, 1));
+        uint pixel_x = min((uint)(shadow_position.x * float(resolution.x)), resolution.x - 1);
+        uint pixel_y = min((uint)(shadow_position.y * float(resolution.y)), resolution.y - 1);
         uint tile_x = min(pixel_x / static_shadow.sst_tile_size, static_shadow.sst_tile_grid.x - 1);
         uint tile_y = min(pixel_y / static_shadow.sst_tile_size, static_shadow.sst_tile_grid.y - 1);
         uint root_index = static_shadow.sst_tile_roots[tile_y * static_shadow.sst_tile_grid.x + tile_x];
@@ -495,8 +495,8 @@ struct Scene {
 
         uint tile_origin_x = tile_x * static_shadow.sst_tile_size;
         uint tile_origin_y = tile_y * static_shadow.sst_tile_size;
-        uint tile_extent_x = max(min(static_shadow.sst_tile_size, resolution - tile_origin_x), 1);
-        uint tile_extent_y = max(min(static_shadow.sst_tile_size, resolution - tile_origin_y), 1);
+        uint tile_extent_x = max(min(static_shadow.sst_tile_size, resolution.x - tile_origin_x), 1);
+        uint tile_extent_y = max(min(static_shadow.sst_tile_size, resolution.y - tile_origin_y), 1);
         float local_x = ((float(pixel_x) + 0.5) - float(tile_origin_x)) / float(tile_extent_x);
         float local_y = ((float(pixel_y) + 0.5) - float(tile_origin_y)) / float(tile_extent_y);
         uint tree_bits = is_power_of_two_uint(static_shadow.sst_tile_size) ? log2_power_of_two_uint(static_shadow.sst_tile_size) : 0;
@@ -628,9 +628,9 @@ struct Scene {
             return sample_depth_texture_sun_visibility(shadow_position);
         }
 
-        uint resolution = max(static_shadow.resolution, 1);
-        uint pixel_x = min((uint)(shadow_position.x * float(resolution)), resolution - 1);
-        uint pixel_y = min((uint)(shadow_position.y * float(resolution)), resolution - 1);
+        uint2 resolution = max(static_shadow.resolution, uint2(1, 1));
+        uint pixel_x = min((uint)(shadow_position.x * float(resolution.x)), resolution.x - 1);
+        uint pixel_y = min((uint)(shadow_position.y * float(resolution.y)), resolution.y - 1);
         uint tile_x = min(pixel_x / static_shadow.sst_tile_size, static_shadow.sst_tile_grid.x - 1);
         uint tile_y = min(pixel_y / static_shadow.sst_tile_size, static_shadow.sst_tile_grid.y - 1);
         uint root_index = static_shadow.sst_tile_roots[tile_y * static_shadow.sst_tile_grid.x + tile_x];
@@ -639,8 +639,8 @@ struct Scene {
 
         uint tile_origin_x = tile_x * static_shadow.sst_tile_size;
         uint tile_origin_y = tile_y * static_shadow.sst_tile_size;
-        uint tile_extent_x = max(min(static_shadow.sst_tile_size, resolution - tile_origin_x), 1);
-        uint tile_extent_y = max(min(static_shadow.sst_tile_size, resolution - tile_origin_y), 1);
+        uint tile_extent_x = max(min(static_shadow.sst_tile_size, resolution.x - tile_origin_x), 1);
+        uint tile_extent_y = max(min(static_shadow.sst_tile_size, resolution.y - tile_origin_y), 1);
         float local_x = ((float(pixel_x) + 0.5) - float(tile_origin_x)) / float(tile_extent_x);
         float local_y = ((float(pixel_y) + 0.5) - float(tile_origin_y)) / float(tile_extent_y);
         uint tree_bits = is_power_of_two_uint(static_shadow.sst_tile_size) ? log2_power_of_two_uint(static_shadow.sst_tile_size) : 0;
@@ -706,9 +706,9 @@ struct Scene {
             return sample_depth_texture_sun_visibility(shadow_position);
         }
 
-        uint resolution = max(static_shadow.resolution, 1);
-        uint pixel_x = min((uint)(shadow_position.x * float(resolution)), resolution - 1);
-        uint pixel_y = min((uint)(shadow_position.y * float(resolution)), resolution - 1);
+        uint2 resolution = max(static_shadow.resolution, uint2(1, 1));
+        uint pixel_x = min((uint)(shadow_position.x * float(resolution.x)), resolution.x - 1);
+        uint pixel_y = min((uint)(shadow_position.y * float(resolution.y)), resolution.y - 1);
         uint tile_x = min(pixel_x / static_shadow.sst_tile_size, static_shadow.sst_tile_grid.x - 1);
         uint tile_y = min(pixel_y / static_shadow.sst_tile_size, static_shadow.sst_tile_grid.y - 1);
         uint node_word_offset = static_shadow.sst_compact_roots[tile_y * static_shadow.sst_tile_grid.x + tile_x];
@@ -717,8 +717,8 @@ struct Scene {
 
         uint tile_origin_x = tile_x * static_shadow.sst_tile_size;
         uint tile_origin_y = tile_y * static_shadow.sst_tile_size;
-        uint tile_extent_x = max(min(static_shadow.sst_tile_size, resolution - tile_origin_x), 1);
-        uint tile_extent_y = max(min(static_shadow.sst_tile_size, resolution - tile_origin_y), 1);
+        uint tile_extent_x = max(min(static_shadow.sst_tile_size, resolution.x - tile_origin_x), 1);
+        uint tile_extent_y = max(min(static_shadow.sst_tile_size, resolution.y - tile_origin_y), 1);
         float local_x = ((float(pixel_x) + 0.5) - float(tile_origin_x)) / float(tile_extent_x);
         float local_y = ((float(pixel_y) + 0.5) - float(tile_origin_y)) / float(tile_extent_y);
         uint tree_bits = is_power_of_two_uint(static_shadow.sst_tile_size) ? log2_power_of_two_uint(static_shadow.sst_tile_size) : 0;
@@ -779,7 +779,7 @@ struct Scene {
 
     float sample_compact_sst_sun_visibility_pcf3(float3 shadow_position)
     {
-        float2 texel_size = 1.0 / float2(max(static_shadow.resolution, 1));
+        float2 texel_size = 1.0 / float2(max(static_shadow.resolution, uint2(1, 1)));
         float visibility = 0.0;
         [unroll]
         for (int y = -1; y <= 1; y++)

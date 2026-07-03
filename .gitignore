@@ -6,3 +6,4 @@ code_ref/
 .claude/
 .codebuddy/
 headless_output.png
+sst_encoder_build/

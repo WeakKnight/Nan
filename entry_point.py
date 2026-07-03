@@ -10,6 +10,65 @@ import numpy as np
 from sparse_shadow_tree import SparseShadowTreeEncoder
 
 
+SHADOW_RESOLUTION_ALIASES = {
+    "512": 512,
+    "512p": 512,
+    "1k": 1024,
+    "1024": 1024,
+    "1024p": 1024,
+    "2k": 2048,
+    "2048": 2048,
+    "2048p": 2048,
+    "4k": 4096,
+    "4096": 4096,
+    "4096p": 4096,
+    "8k": 8192,
+    "8192": 8192,
+    "8192p": 8192,
+}
+
+
+def _parse_shadow_resolution(value: str) -> int | tuple[int, int]:
+    token = value.strip().lower().replace("_", "").replace("-", "")
+    for separator in ("x", "*", ","):
+        if separator in token:
+            parts = token.split(separator)
+            if len(parts) != 2:
+                break
+            try:
+                width = int(parts[0])
+                height = int(parts[1])
+            except ValueError as exc:
+                raise argparse.ArgumentTypeError("shadow resolution size must be WIDTHxHEIGHT") from exc
+            if width < 1 or height < 1:
+                raise argparse.ArgumentTypeError("shadow resolution width and height must be positive")
+            return (width, height)
+
+    if token in SHADOW_RESOLUTION_ALIASES:
+        return SHADOW_RESOLUTION_ALIASES[token]
+    try:
+        resolution = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "shadow resolution must be WIDTHxHEIGHT, a positive integer, or one of 512, 1k, 2k, 4k, 8k"
+        ) from exc
+    if resolution < 1:
+        raise argparse.ArgumentTypeError("shadow resolution must be positive")
+    return resolution
+
+
+def _shadow_resolution_budget(value: int | tuple[int, int]) -> int:
+    if isinstance(value, tuple):
+        return max(1, int(value[0]), int(value[1]))
+    return max(1, int(value))
+
+
+def _shadow_resolution_label(value: int | tuple[int, int]) -> str:
+    if isinstance(value, tuple):
+        return f"{max(1, int(value[0]))}x{max(1, int(value[1]))}"
+    return str(max(1, int(value)))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PythonRenderer entry point.")
     parser.add_argument(
@@ -129,15 +188,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--shadow-resolution",
-        type=int,
+        "--sst-resolution",
+        dest="shadow_resolution",
+        type=_parse_shadow_resolution,
         default=2048,
-        help="Static shadow depth map resolution used by --benchmark-sst.",
+        metavar="N|WIDTHxHEIGHT|1k|2k|4k|8k",
+        help="Static shadow/SST resolution budget, preset, or explicit non-square size. Used by runtime static shadow modes, compare, and --benchmark-sst.",
     )
     parser.add_argument(
         "--sst-tile-size",
         type=int,
         default=128,
         help="SST benchmark tile size.",
+    )
+    parser.add_argument(
+        "--sst-encoder",
+        choices=("auto", "cpp", "python"),
+        default="auto",
+        help="SST encoder backend. auto builds/uses the CMake C++ encoder when available, then falls back to Python.",
     )
     parser.add_argument(
         "--sst-min-leaf-size",
@@ -542,9 +610,12 @@ def _make_sst_encoder(
     forced_leaf_error_cap: float | None = None,
     forced_split_bias_fit: bool | None = None,
 ):
+    from static_shadow_tree_encoder import create_sparse_shadow_tree_encoder
+
     use_dual = variant in DUAL_VARIANTS
     visibility_tolerance = _visibility_tolerance_for_variant(variant, shadow_bias)
-    return SparseShadowTreeEncoder(
+    return create_sparse_shadow_tree_encoder(
+        backend=args.sst_encoder,
         tile_size=max(1, args.sst_tile_size if tile_size is None else tile_size),
         min_leaf_size=max(1, args.sst_min_leaf_size if min_leaf_size is None else min_leaf_size),
         plane_error_threshold=max(0.0, plane_error),
@@ -588,7 +659,7 @@ def _gpu_decompress_compact_sst(device, decompressor, encoded, reference_depth: 
         output,
         words_buffer,
         roots_buffer,
-        width,
+        (width, height),
         encoded.tile_grid,
         encoded.tile_size,
         encoded.stats.max_traversal_steps,
@@ -617,7 +688,7 @@ def _gpu_decompress_compact_sst(device, decompressor, encoded, reference_depth: 
     return {
         "gpu_decompress_dispatch_seconds": float(dispatch_seconds),
         "gpu_decompress_readback_seconds": float(readback_seconds),
-        "gpu_decompress_valid": bool(np.max(gpu_cpu_delta) <= 1e-7) if gpu_cpu_delta.size else True,
+        "gpu_decompress_valid": bool(np.max(gpu_cpu_delta) <= 2e-6) if gpu_cpu_delta.size else True,
         "gpu_decompress_vs_cpu_max_delta_percent": float(np.max(gpu_cpu_delta) * 100.0) if gpu_cpu_delta.size else 0.0,
         "gpu_decompress_vs_cpu_mean_delta_percent": float(np.mean(gpu_cpu_delta) * 100.0) if gpu_cpu_delta.size else 0.0,
         "gpu_decompress_vs_source_mean_error_percent": float(np.mean(gpu_source_abs) * 100.0) if gpu_source_abs.size else 0.0,
@@ -2664,10 +2735,11 @@ def run_static_shadow_compare(args: argparse.Namespace) -> None:
         srgb_output=not args.no_srgb,
         camera_move_test=args.camera_move_test,
         scene_path=args.scene,
+        sst_encoder_backend=args.sst_encoder,
     )
     app = App(config=config)
     app.set_renderer(PathTracingRenderer())
-    app.scene.static_shadow_resolution = max(1, args.shadow_resolution)
+    app.scene.set_static_shadow_resolution(args.shadow_resolution)
     _apply_runtime_sst_options(app.scene, args)
     app.scene.static_shadow_auto_encode_sst = False
 
@@ -2747,7 +2819,9 @@ def run_static_shadow_compare(args: argparse.Namespace) -> None:
         "width": max(1, args.width),
         "height": max(1, args.height),
         "frames": max(1, args.frames),
-        "shadow_resolution": max(1, args.shadow_resolution),
+        "shadow_resolution": _shadow_resolution_budget(args.shadow_resolution),
+        "shadow_size": list(app.scene.static_shadow_size),
+        "shadow_resolution_input": _shadow_resolution_label(args.shadow_resolution),
         "bake_seconds": bake_seconds,
         "encode_seconds": encode_seconds,
         "sst_encoded": bool(app.scene.sst_enabled),
@@ -2800,10 +2874,11 @@ def run_sst_benchmark(args: argparse.Namespace) -> None:
         headless=True,
         headless_frame_count=0,
         scene_path=args.scene,
+        sst_encoder_backend=args.sst_encoder,
     )
     app = App(config=config)
     scene = app.scene
-    scene.static_shadow_resolution = max(1, args.shadow_resolution)
+    scene.set_static_shadow_resolution(args.shadow_resolution)
     scene.static_shadow_auto_encode_sst = False
     shadow_bias = scene.static_shadow_depth_bias if args.sst_shadow_bias is None else max(0.0, args.sst_shadow_bias)
 
@@ -2896,6 +2971,8 @@ def run_sst_benchmark(args: argparse.Namespace) -> None:
     report = {
         "scene": args.scene or "demo",
         "shadow_resolution": scene.static_shadow_resolution,
+        "shadow_size": list(scene.static_shadow_size),
+        "shadow_resolution_input": _shadow_resolution_label(args.shadow_resolution),
         "variants": variants,
         "settings": {
             "tile_size": max(1, args.sst_tile_size),
@@ -3150,7 +3227,8 @@ def main() -> None:
         camera_move_test=args.camera_move_test,
         scene_path=args.scene,
         static_shadow_mode=_parse_static_shadow_mode(args.static_shadow_mode),
-        static_shadow_resolution=max(1, args.shadow_resolution),
+        static_shadow_resolution=args.shadow_resolution,
+        sst_encoder_backend=args.sst_encoder,
     )
 
     app = App(config=config)

@@ -34,7 +34,8 @@ class AppConfig:
     camera_move_test: bool = False
     scene_path: str | None = None
     static_shadow_mode: int | None = None
-    static_shadow_resolution: int | None = None
+    static_shadow_resolution: int | tuple[int, int] | None = None
+    sst_encoder_backend: str = "auto"
 
 class App:
     def __init__(self, config: Optional[AppConfig] = None):
@@ -87,6 +88,9 @@ class App:
 
         self.event_dispatcher: SyncEventDispatcher = event_dispatcher.SyncEventDispatcher()
         self.scene: Scene = Scene(self.device, self.scene_node, self.event_dispatcher)
+        self.scene.set_sst_encoder_backend(self.config.sst_encoder_backend)
+        if self.config.static_shadow_resolution is not None:
+            self.scene.set_static_shadow_resolution(self.config.static_shadow_resolution)
 
         self.camera_controller: CameraController = CameraController(self.scene_node.camera)
         self.camera_controller.move_test = self.config.camera_move_test
@@ -186,10 +190,10 @@ class App:
             self.config.static_shadow_resolution,
         )
 
-    def configure_static_shadow_mode(self, requested_mode: int, resolution: int | None = None) -> None:
+    def configure_static_shadow_mode(self, requested_mode: int, resolution: int | tuple[int, int] | None = None) -> None:
         requested_mode = max(Scene.SHADOW_MODE_REALTIME, min(Scene.SHADOW_MODE_DECOMPRESSED_SST, int(requested_mode)))
         if resolution is not None:
-            self.scene.static_shadow_resolution = max(1, int(resolution))
+            self.scene.set_static_shadow_resolution(resolution)
         if requested_mode == Scene.SHADOW_MODE_REALTIME:
             self.scene.static_shadow_mode = Scene.SHADOW_MODE_REALTIME
             return
@@ -205,7 +209,7 @@ class App:
 
         print(
             "[App] Baking static shadow before render: "
-            f"mode={requested_mode} resolution={self.scene.static_shadow_resolution}"
+            f"mode={requested_mode} size={self.scene.static_shadow_size[0]}x{self.scene.static_shadow_size[1]}"
         )
         self.scene.bake_static_shadow_depth_map()
         if needs_sst and not self.scene.sst_enabled:

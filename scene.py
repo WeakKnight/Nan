@@ -25,6 +25,7 @@ from sun_position import SunPosition, SunPositionData
 from texture_manager import TextureManager, TextureType, TextureRecord
 from static_shadow_depth_map import StaticShadowDepthMap
 from sparse_shadow_tree import SparseShadowTreeEncoder, SparseShadowTreeStats
+from static_shadow_tree_encoder import create_sparse_shadow_tree_encoder
 from sst_decompress import SSTDecompressor
 
 
@@ -44,6 +45,7 @@ class Scene:
     SST_PRESET_QUALITY = 0
     SST_PRESET_HIGH_COMPRESSION = 1
     SST_PRESET_MANUAL = 2
+    STATIC_SHADOW_RESOLUTION_PRESETS = (512, 1024, 2048, 4096, 8192)
 
     # Instance flags (must match InstanceFlags in common.slang)
     INSTANCE_FLAG_NONE = 0
@@ -146,7 +148,9 @@ class Scene:
         # UI elements
         self._hours_slider: spy.ui.SliderFloat | None = None
         self._intensity_slider: spy.ui.SliderFloat | None = None
+        self._static_shadow_resolution_combo: spy.ui.ComboBox | None = None
         self._static_shadow_status_text: spy.ui.Text | None = None
+        self._syncing_static_shadow_ui: bool = False
         
         # Location for sun position calculation (default: Chengdu, async update)
         self._latitude: float = SunPosition.DEFAULT_LATITUDE
@@ -160,6 +164,9 @@ class Scene:
         # Static shadow depth map state. The renderer falls back to realtime
         # ray-query shadows until a valid bake is produced.
         self.static_shadow_resolution: int = 2048
+        self.static_shadow_size: tuple[int, int] = (2048, 2048)
+        self.static_shadow_fixed_size: tuple[int, int] | None = None
+        self._static_shadow_light_extent: np.ndarray = np.array([1.0, 1.0, 1.0], dtype=np.float32)
         self.static_shadow_depth_bias: float = 0.0015
         self.static_shadow_enabled: bool = False
         self.static_shadow_mode: int = Scene.SHADOW_MODE_REALTIME
@@ -193,6 +200,7 @@ class Scene:
         )
         self.sst_fit_profile: int = Scene.SST_FIT_DUAL_VISIBLE
         self.sst_preset: int = Scene.SST_PRESET_QUALITY
+        self.sst_encoder_backend: str = "auto"
         self.sst_tile_profile: int = 1  # 0=64, 1=128, 2=256
         self.sst_min_leaf_size: int = 2
         self.sst_quantization_search_radius: int = 0
@@ -546,6 +554,29 @@ class Scene:
         pad = np.maximum(extent * 0.01, np.array([0.01, 0.01, 0.01], dtype=np.float32))
         return bounds_min - pad, bounds_max + pad
 
+    def _compute_static_shadow_size_from_light_extent(self, light_extent: np.ndarray) -> tuple[int, int]:
+        if self.static_shadow_fixed_size is not None:
+            return self.static_shadow_fixed_size
+
+        max_resolution = max(1, int(self.static_shadow_resolution))
+        extent_x = max(float(light_extent[0]), 1e-6)
+        extent_y = max(float(light_extent[1]), 1e-6)
+        max_extent = max(extent_x, extent_y)
+        transition_sample_distance = max(2.0 * max_extent / float(max_resolution), 1e-6)
+
+        # Mirrors Unreal Lightmass' static shadow depth-map sizing shape:
+        # size per axis comes from light-space coverage / sample distance,
+        # then a max-sample budget clamp preserves aspect ratio.
+        shadow_size_x = max(4, int(math.trunc(extent_x * 2.0 / transition_sample_distance)))
+        shadow_size_y = max(4, int(math.trunc(extent_y * 2.0 / transition_sample_distance)))
+        max_samples = int(max_resolution) * int(max_resolution)
+        if shadow_size_x * shadow_size_y > max_samples:
+            aspect_ratio = shadow_size_x / float(max(shadow_size_y, 1))
+            shadow_size_y = max(4, int(math.trunc(math.sqrt(max_samples / max(aspect_ratio, 1e-6)))))
+            shadow_size_x = max(4, int(math.trunc(max_samples / float(max(shadow_size_y, 1)))))
+
+        return (shadow_size_x, shadow_size_y)
+
     def _make_static_shadow_matrices(self) -> tuple[spy.float4x4, spy.float4x4]:
         sun_direction = np.array(
             [float(self._sun_direction[0]), float(self._sun_direction[1]), float(self._sun_direction[2])],
@@ -583,6 +614,8 @@ class Scene:
         light_min = light_space.min(axis=0)
         light_max = light_space.max(axis=0)
         light_extent = np.maximum(light_max - light_min, np.array([1e-4, 1e-4, 1e-4], dtype=np.float32))
+        self._static_shadow_light_extent = light_extent
+        self.static_shadow_size = self._compute_static_shadow_size_from_light_extent(light_extent)
 
         world_to_shadow = np.array(
             [
@@ -606,8 +639,92 @@ class Scene:
             except AttributeError:
                 pass
 
+    def _static_shadow_resolution_values(self) -> tuple[int, ...]:
+        resolution = max(1, int(self.static_shadow_resolution))
+        presets = tuple(max(1, int(value)) for value in Scene.STATIC_SHADOW_RESOLUTION_PRESETS)
+        if resolution in presets:
+            return presets
+        return tuple(sorted(set((*presets, resolution))))
+
+    def _static_shadow_resolution_labels(self) -> list[str]:
+        labels = [str(value) for value in self._static_shadow_resolution_values()]
+        if self.static_shadow_fixed_size is not None:
+            fixed_label = self._static_shadow_size_label(self.static_shadow_fixed_size)
+            if fixed_label not in labels:
+                labels.append(fixed_label)
+        return labels
+
+    def _static_shadow_resolution_index(self) -> int:
+        labels = self._static_shadow_resolution_labels()
+        if self.static_shadow_fixed_size is not None:
+            try:
+                return labels.index(self._static_shadow_size_label(self.static_shadow_fixed_size))
+            except ValueError:
+                return 0
+        values = self._static_shadow_resolution_values()
+        resolution = max(1, int(self.static_shadow_resolution))
+        try:
+            return values.index(resolution)
+        except ValueError:
+            return 0
+
+    def _sync_static_shadow_resolution_ui(self):
+        if self._static_shadow_resolution_combo is None:
+            return
+
+        self._syncing_static_shadow_ui = True
+        try:
+            self._static_shadow_resolution_combo.items = self._static_shadow_resolution_labels()
+            self._static_shadow_resolution_combo.value = self._static_shadow_resolution_index()
+        finally:
+            self._syncing_static_shadow_ui = False
+
     def _sync_shadow_mode_ui(self):
         pass
+
+    def _static_shadow_size_label(self, size: tuple[int, int] | None = None) -> str:
+        width, height = self.static_shadow_size if size is None else size
+        return f"{max(1, int(width))}x{max(1, int(height))}"
+
+    def _invalidate_static_shadow_bake(self):
+        self.static_shadow_enabled = False
+        self.sst_enabled = False
+        self.sst_stats = None
+        self.static_shadow_mode = Scene.SHADOW_MODE_REALTIME
+        self._sync_static_shadow_resolution_ui()
+        self._sync_shadow_mode_ui()
+        self._update_static_shadow_status()
+        self._reset_accumulation()
+
+    def set_static_shadow_size(self, width: int, height: int):
+        size = (max(1, int(width)), max(1, int(height)))
+        if self.static_shadow_fixed_size == size and self.static_shadow_size == size:
+            self._sync_static_shadow_resolution_ui()
+            return
+
+        self.static_shadow_fixed_size = size
+        self.static_shadow_size = size
+        self.static_shadow_resolution = max(size)
+        self._invalidate_static_shadow_bake()
+        print(f"[Scene] Static shadow/SST size set to {size[0]}x{size[1]}; rebake required")
+
+    def set_static_shadow_resolution(self, resolution: int | tuple[int, int]):
+        if isinstance(resolution, (tuple, list)):
+            if len(resolution) != 2:
+                raise ValueError("static shadow resolution tuple must be (width, height)")
+            self.set_static_shadow_size(int(resolution[0]), int(resolution[1]))
+            return
+
+        resolution = max(1, int(resolution))
+        if resolution == self.static_shadow_resolution and self.static_shadow_fixed_size is None:
+            self._sync_static_shadow_resolution_ui()
+            return
+
+        self.static_shadow_fixed_size = None
+        self.static_shadow_resolution = resolution
+        self.static_shadow_size = self._compute_static_shadow_size_from_light_extent(self._static_shadow_light_extent)
+        self._invalidate_static_shadow_bake()
+        print(f"[Scene] Static shadow/SST resolution budget set to {resolution}; fit size {self._static_shadow_size_label()}; rebake required")
 
     def _create_sst_node_buffer(self, node_bytes: bytes, label: str):
         return self.device.create_buffer(
@@ -631,7 +748,7 @@ class Scene:
         tile_sizes = (64, 128, 256)
         return tile_sizes[min(max(int(profile), 0), len(tile_sizes) - 1)]
 
-    def _create_sst_encoder_for_profile(self, profile: int) -> SparseShadowTreeEncoder:
+    def _create_sst_encoder_for_profile(self, profile: int):
         profile = min(max(int(profile), Scene.SST_FIT_DUAL_BIAS), Scene.SST_FIT_DUAL_LOOSE_VISIBLE)
         visibility_tolerance = 0.0
         if profile == Scene.SST_FIT_DUAL_HALF_VISIBLE:
@@ -643,7 +760,8 @@ class Scene:
         elif profile == Scene.SST_FIT_DUAL_LOOSE_VISIBLE:
             visibility_tolerance = self.static_shadow_depth_bias * 4.0
 
-        return SparseShadowTreeEncoder(
+        return create_sparse_shadow_tree_encoder(
+            backend=self.sst_encoder_backend,
             tile_size=self._sst_tile_size_from_profile(),
             min_leaf_size=max(1, int(self.sst_min_leaf_size)),
             dual_depth_slack=self.static_shadow_depth_bias * max(0.0, float(self.sst_dual_depth_slack_scale)),
@@ -652,6 +770,18 @@ class Scene:
             shadow_bias=self.static_shadow_depth_bias,
             plane_quantization_search_radius=max(0, int(self.sst_quantization_search_radius)),
         )
+
+    def set_sst_encoder_backend(self, backend: str):
+        backend = backend.strip().lower()
+        if backend not in ("auto", "cpp", "python"):
+            raise ValueError(f"Unsupported SST encoder backend '{backend}'")
+        if backend == self.sst_encoder_backend:
+            return
+
+        self.sst_encoder_backend = backend
+        self._refresh_sst_encoder()
+        self._invalidate_sst_encoding()
+        self._update_static_shadow_status()
 
     def _invalidate_sst_encoding(self):
         if self.sst_enabled:
@@ -757,12 +887,15 @@ class Scene:
             f"Leaf={self.sst_min_leaf_size} "
         )
         if not self.static_shadow_enabled:
-            self._set_static_shadow_status(f"Static shadow: not baked Strategy={profile_name} CompactPCF {sst_config_text}")
+            self._set_static_shadow_status(
+                f"Static shadow: not baked Size={self._static_shadow_size_label()} Budget={self.static_shadow_resolution} "
+                f"Strategy={profile_name} CompactPCF {sst_config_text}"
+            )
             return
 
         if self.sst_enabled and self.sst_stats is not None:
             self._set_static_shadow_status(
-                f"Mode={mode_name} Strategy={profile_name} CompactPCF Depth={self.static_shadow_resolution} "
+                f"Mode={mode_name} Strategy={profile_name} CompactPCF Size={self._static_shadow_size_label()} "
                 f"{sst_config_text} "
                 f"Tiles={self.sst_stats.tile_count} Nodes={self.sst_stats.node_count} "
                 f"Steps={self.sst_stats.max_traversal_steps} "
@@ -773,7 +906,7 @@ class Scene:
                 f"MeanLoss={self.sst_stats.mean_error_percent:.3f}%"
             )
         else:
-            self._set_static_shadow_status(f"Mode={mode_name} Strategy={profile_name} CompactPCF Depth={self.static_shadow_resolution} {sst_config_text} SST=not encoded")
+            self._set_static_shadow_status(f"Mode={mode_name} Strategy={profile_name} CompactPCF Size={self._static_shadow_size_label()} {sst_config_text} SST=not encoded")
 
     def encode_sparse_shadow_tree(self):
         if not self.static_shadow_enabled:
@@ -812,8 +945,8 @@ class Scene:
         )
         self.sst_decompressed_depth_texture = self.device.create_texture(
             format=spy.Format.r32_float,
-            width=self.static_shadow_resolution,
-            height=self.static_shadow_resolution,
+            width=int(depth_data.shape[1]),
+            height=int(depth_data.shape[0]),
             usage=spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access,
             label="sst_decompressed_depth_map",
         )
@@ -836,7 +969,7 @@ class Scene:
                 self.sst_decompressed_depth_texture,
                 self.sst_compact_words_buffer,
                 self.sst_compact_roots_buffer,
-                self.static_shadow_resolution,
+                (int(depth_data.shape[1]), int(depth_data.shape[0])),
                 self.sst_tile_grid,
                 self.sst_tile_size,
                 self.sst_max_traversal_steps,
@@ -872,17 +1005,18 @@ class Scene:
 
     def bake_static_shadow_depth_map(self):
         self.static_shadow_world_to_light, shadow_to_world = self._make_static_shadow_matrices()
+        shadow_width, shadow_height = self.static_shadow_size
         shadow_depth_texture = self.device.create_texture(
             format=spy.Format.r32_float,
-            width=self.static_shadow_resolution,
-            height=self.static_shadow_resolution,
+            width=shadow_width,
+            height=shadow_height,
             usage=spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access,
             label="static_shadow_depth_map",
         )
         shadow_second_depth_texture = self.device.create_texture(
             format=spy.Format.r32_float,
-            width=self.static_shadow_resolution,
-            height=self.static_shadow_resolution,
+            width=shadow_width,
+            height=shadow_height,
             usage=spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access,
             label="static_shadow_second_depth_map",
         )
@@ -911,7 +1045,7 @@ class Scene:
         self._sync_shadow_mode_ui()
         self._update_static_shadow_status()
         self._reset_accumulation()
-        print(f"[Scene] Static shadow depth map baked at {self.static_shadow_resolution}x{self.static_shadow_resolution}")
+        print(f"[Scene] Static shadow depth map baked at {shadow_width}x{shadow_height} (budget={self.static_shadow_resolution})")
         if self.static_shadow_auto_encode_sst:
             self.encode_sparse_shadow_tree()
 
@@ -1125,12 +1259,30 @@ class Scene:
         self._hours_slider = spy.ui.SliderFloat(ui_window, 'Hours', min=0, max=23.99, value=current_hours)
         # Directional light intensity slider (0 to 20, default: PI)
         self._intensity_slider = spy.ui.SliderFloat(ui_window, 'Sun Intensity', min=0, max=20, value=self._directional_light_intensity)
+
+        def on_static_shadow_resolution_changed(value=None):
+            if self._syncing_static_shadow_ui or self._static_shadow_resolution_combo is None:
+                return
+            index = self._static_shadow_resolution_combo.value if value is None else int(value)
+            values = self._static_shadow_resolution_values()
+            if 0 <= index < len(values):
+                self.set_static_shadow_resolution(values[index])
+
+        self._static_shadow_resolution_combo = spy.ui.ComboBox(
+            ui_window,
+            'SST Resolution',
+            items=self._static_shadow_resolution_labels(),
+            value=self._static_shadow_resolution_index(),
+            callback=on_static_shadow_resolution_changed,
+        )
         
         def bake_static_shadow_btn():
             self.bake_static_shadow_depth_map()
         
-        spy.ui.Button(ui_window, 'Bake Static Shadow Depth Map', callback=bake_static_shadow_btn)
+        spy.ui.Button(ui_window, 'Bake Static Shadow + SST', callback=bake_static_shadow_btn)
         self._static_shadow_status_text = spy.ui.Text(ui_window, 'Static shadow: not baked')
+        self._sync_static_shadow_resolution_ui()
+        self._update_static_shadow_status()
         # Initialize sun position with current time
         self._update_sun_from_hours(current_hours)
     
@@ -1186,7 +1338,7 @@ class Scene:
         cursor["static_shadow"]["depth_sampler"] = self.static_shadow_sampler
         cursor["static_shadow"]["world_to_shadow"] = self.static_shadow_world_to_light
         cursor["static_shadow"]["enabled"] = 1 if self.static_shadow_enabled else 0
-        cursor["static_shadow"]["resolution"] = self.static_shadow_resolution
+        cursor["static_shadow"]["resolution"] = spy.uint2(int(self.static_shadow_size[0]), int(self.static_shadow_size[1]))
         cursor["static_shadow"]["depth_bias"] = self.static_shadow_depth_bias
         cursor["static_shadow"]["shadow_mode"] = self.static_shadow_mode
         cursor["static_shadow"]["sst_enabled"] = 1 if self.sst_enabled else 0
