@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from vertex_baking_utils import bake_least_squares, build_native
 from model import load_gltf_model
 from surface_sampler import sample_model_surface
-from vertex_color_baker import _vertex_anchor_samples, bake_model_vertex_colors, sample_base_color_values
+from vertex_color_baker import _sample_material_nearest, _vertex_anchor_samples, bake_model_vertex_colors, sample_base_color_values
 
 
 class VertexBakingUtilsTests(unittest.TestCase):
@@ -115,6 +115,29 @@ class VertexBakingUtilsTests(unittest.TestCase):
             upper = reference_values.max(axis=0)
             self.assertTrue(np.all(mesh_values >= lower - 1e-6))
             self.assertTrue(np.all(mesh_values <= upper + 1e-6))
+
+    def test_batched_texture_sampling_matches_scalar_sampling(self):
+        root = Path(__file__).resolve().parents[1]
+        model = load_gltf_model(root / "vertex_baker" / "glTF" / "Lantern.gltf")
+        samples = sample_model_surface(model, 2048, seed=13)
+
+        batched_values = sample_base_color_values(model, samples)
+        scalar_values = np.zeros_like(batched_values)
+        for sample_index in range(samples.positions.shape[0]):
+            mesh_index = int(samples.mesh_indices[sample_index])
+            triangle_index = int(samples.triangle_indices[sample_index])
+            mesh = model.meshes[mesh_index]
+            material = model.materials[mesh.material_index]
+            triangle = mesh.indices[triangle_index].astype(np.int64)
+            bary = samples.barycentrics[sample_index]
+            uv = (
+                bary[0] * mesh.uvs[triangle[0]]
+                + bary[1] * mesh.uvs[triangle[1]]
+                + bary[2] * mesh.uvs[triangle[2]]
+            )
+            scalar_values[sample_index] = _sample_material_nearest(material, uv)
+
+        np.testing.assert_array_equal(batched_values, scalar_values)
 
     def test_lantern_vertex_colors_have_bounded_vertex_anchor_error(self):
         root = Path(__file__).resolve().parents[1]

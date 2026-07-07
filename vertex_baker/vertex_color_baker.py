@@ -21,21 +21,39 @@ def _sample_material_nearest(material: Material, uv: npt.NDArray[np.float32]) ->
     return (texture[y, x, :3] * material.base_color[:3]).astype(np.float32)
 
 
+def _sample_material_nearest_batch(material: Material, uvs: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
+    uvs = np.asarray(uvs, dtype=np.float32)
+    if uvs.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    if material.base_color_texture is None:
+        return np.broadcast_to(material.base_color[:3], (uvs.shape[0], 3)).astype(np.float32, copy=True)
+
+    texture = material.base_color_texture
+    h, w, _ = texture.shape
+    u = np.mod(uvs[:, 0].astype(np.float64), 1.0)
+    v = np.mod(uvs[:, 1].astype(np.float64), 1.0)
+    x = np.clip((u * float(w - 1)).astype(np.int64), 0, w - 1)
+    y = np.clip((v * float(h - 1)).astype(np.int64), 0, h - 1)
+    return (texture[y, x, :3] * material.base_color[:3]).astype(np.float32)
+
+
 def sample_base_color_values(model: Model, samples: SurfaceSamples) -> npt.NDArray[np.float32]:
     values = np.zeros((samples.positions.shape[0], 3), dtype=np.float32)
-    for sample_index in range(samples.positions.shape[0]):
-        mesh_index = int(samples.mesh_indices[sample_index])
-        triangle_index = int(samples.triangle_indices[sample_index])
+    for mesh_index, mesh in enumerate(model.meshes):
+        mask = samples.mesh_indices == mesh_index
+        if not np.any(mask):
+            continue
         mesh = model.meshes[mesh_index]
         material = model.materials[mesh.material_index]
-        tri = mesh.indices[triangle_index].astype(np.int64)
-        bary = samples.barycentrics[sample_index]
-        uv = (
-            bary[0] * mesh.uvs[tri[0]]
-            + bary[1] * mesh.uvs[tri[1]]
-            + bary[2] * mesh.uvs[tri[2]]
+        triangles = mesh.indices[samples.triangle_indices[mask]].astype(np.int64)
+        triangle_uvs = mesh.uvs[triangles]
+        bary = samples.barycentrics[mask]
+        uvs = (
+            bary[:, 0, None] * triangle_uvs[:, 0]
+            + bary[:, 1, None] * triangle_uvs[:, 1]
+            + bary[:, 2, None] * triangle_uvs[:, 2]
         )
-        values[sample_index] = _sample_material_nearest(material, uv)
+        values[mask] = _sample_material_nearest_batch(material, uvs)
     return values
 
 
@@ -76,9 +94,7 @@ def _vertex_anchor_samples(
             np.zeros((0, 3), dtype=np.float32),
         )
 
-    anchor_values = np.zeros((int(np.count_nonzero(used)), 3), dtype=np.float32)
-    for out_index, vertex_index in enumerate(np.nonzero(used)[0]):
-        anchor_values[out_index] = _sample_material_nearest(material, mesh.uvs[vertex_index])
+    anchor_values = _sample_material_nearest_batch(material, mesh.uvs[used])
 
     return (
         np.nonzero(used)[0].astype(np.int64),
