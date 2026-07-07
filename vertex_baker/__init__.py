@@ -1,0 +1,1 @@
+"""Standalone vertex baking experiments."""
