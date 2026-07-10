@@ -9,6 +9,7 @@ from PIL import Image
 
 from model import Material, Model
 from surface_sampler import SurfaceSamples
+from visibility_cone_visualizer import build_visibility_cone_line_segments
 
 
 @dataclass
@@ -99,6 +100,10 @@ def render_unlit_preview(
     point_radius: int = 2,
     point_color=(1.0, 0.55, 0.12),
     vertex_colors: list[npt.NDArray[np.float32]] | None = None,
+    visibility_cones: list[npt.NDArray[np.float32]] | None = None,
+    visibility_cone_length: float = 0.0,
+    visibility_cone_rim_segments: int = 12,
+    visibility_cone_xray: bool = False,
 ) -> None:
     camera = default_camera(model)
     color = np.zeros((height, width, 3), dtype=np.float32)
@@ -171,6 +176,28 @@ def render_unlit_preview(
     if samples is not None and samples.positions.shape[0] > 0:
         _draw_samples(color, depth, samples.positions, camera, width, height, point_radius, np.asarray(point_color, dtype=np.float32), model)
 
+    if visibility_cones is not None:
+        cone_lines = build_visibility_cone_line_segments(
+            model,
+            visibility_cones,
+            cone_length=float(visibility_cone_length),
+            rim_segments=max(3, int(visibility_cone_rim_segments)),
+        )
+        _draw_line_segments(
+            color,
+            depth,
+            cone_lines.starts,
+            cone_lines.ends,
+            cone_lines.colors,
+            cone_lines.alphas,
+            cone_lines.widths,
+            camera,
+            width,
+            height,
+            model,
+            xray=bool(visibility_cone_xray),
+        )
+
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image = np.clip(color, 0.0, 1.0)
@@ -215,3 +242,63 @@ def _draw_samples(
                     continue
                 if z <= float(depth[py, px]) + depth_bias:
                     color[py, px, :] = point_color
+
+
+def _draw_line_segments(
+    color: npt.NDArray[np.float32],
+    depth: npt.NDArray[np.float32],
+    starts: npt.NDArray[np.float32],
+    ends: npt.NDArray[np.float32],
+    line_colors: npt.NDArray[np.float32],
+    alphas: npt.NDArray[np.float32],
+    widths: npt.NDArray[np.int32],
+    camera: Camera,
+    width: int,
+    height: int,
+    model: Model,
+    *,
+    xray: bool,
+) -> None:
+    if starts.shape[0] == 0:
+        return
+    start_screen, start_z = _project(starts, camera, width, height)
+    end_screen, end_z = _project(ends, camera, width, height)
+    scene_diagonal = max(float(np.linalg.norm(model.bounds_max - model.bounds_min)), 1.0)
+    depth_bias = scene_diagonal * 2.0e-4
+
+    for index in range(starts.shape[0]):
+        z0 = float(start_z[index])
+        z1 = float(end_z[index])
+        if z0 <= 1e-4 or z1 <= 1e-4:
+            continue
+        p0 = start_screen[index]
+        p1 = end_screen[index]
+        delta = p1 - p0
+        step_count = max(1, int(np.ceil(float(np.max(np.abs(delta))))))
+        if step_count > max(width, height) * 2:
+            continue
+        line_color = line_colors[index]
+        alpha = float(np.clip(alphas[index], 0.0, 1.0))
+        line_width = max(1, int(widths[index]))
+        offset_begin = -(line_width // 2)
+        offset_end = offset_begin + line_width
+        inverse_z0 = 1.0 / z0
+        inverse_z1 = 1.0 / z1
+        for step in range(step_count + 1):
+            t = float(step) / float(step_count)
+            point = p0 + delta * t
+            x = int(round(float(point[0])))
+            y = int(round(float(point[1])))
+            inverse_z = inverse_z0 * (1.0 - t) + inverse_z1 * t
+            line_z = 1.0 / max(inverse_z, 1e-12)
+            for offset_y in range(offset_begin, offset_end):
+                py = y + offset_y
+                if py < 0 or py >= height:
+                    continue
+                for offset_x in range(offset_begin, offset_end):
+                    px = x + offset_x
+                    if px < 0 or px >= width:
+                        continue
+                    if not xray and line_z > float(depth[py, px]) + depth_bias:
+                        continue
+                    color[py, px, :] = color[py, px, :] * (1.0 - alpha) + line_color * alpha

@@ -25,6 +25,8 @@ class Mesh:
     uvs: npt.NDArray[np.float32]
     indices: npt.NDArray[np.uint32]
     material_index: int
+    proxy_hash_positions: npt.NDArray[np.float32] | None = None
+    proxy_hash_normals: npt.NDArray[np.float32] | None = None
 
 
 @dataclass
@@ -93,19 +95,36 @@ def load_gltf_model(path: str | Path) -> Model:
 
     loaded = trimesh.load(str(path))
     if isinstance(loaded, trimesh.Scene):
-        trimesh_meshes = list(loaded.dump(concatenate=False))
+        trimesh_meshes = []
+        for tri_mesh in loaded.dump(concatenate=False):
+            node_name = tri_mesh.metadata.get("node") if hasattr(tri_mesh, "metadata") else None
+            node_transform = np.eye(4, dtype=np.float64)
+            if node_name is not None and node_name in loaded.graph.nodes_geometry:
+                node_transform, _ = loaded.graph[node_name]
+            trimesh_meshes.append((tri_mesh, np.asarray(node_transform, dtype=np.float64)))
     elif isinstance(loaded, trimesh.Trimesh):
-        trimesh_meshes = [loaded]
+        trimesh_meshes = [(loaded, np.eye(4, dtype=np.float64))]
     else:
         raise ValueError(f"Unsupported asset type: {type(loaded).__name__}")
 
     meshes: list[Mesh] = []
-    for mesh_index, tri_mesh in enumerate(trimesh_meshes):
+    for mesh_index, (tri_mesh, node_transform) in enumerate(trimesh_meshes):
         if len(tri_mesh.vertices) == 0 or len(tri_mesh.faces) == 0:
             continue
 
         positions = tri_mesh.vertices.astype(np.float32)
         normals = tri_mesh.vertex_normals.astype(np.float32)
+        inverse_transform = np.linalg.inv(node_transform)
+        homogeneous_positions = np.concatenate(
+            [positions.astype(np.float64), np.ones((positions.shape[0], 1), dtype=np.float64)],
+            axis=1,
+        )
+        proxy_hash_positions = (inverse_transform @ homogeneous_positions.T).T[:, :3].astype(np.float32)
+        proxy_hash_normals = (inverse_transform[:3, :3] @ normals.astype(np.float64).T).T
+        proxy_hash_normal_lengths = np.linalg.norm(proxy_hash_normals, axis=1)
+        valid_proxy_hash_normals = proxy_hash_normal_lengths > 1e-20
+        proxy_hash_normals[valid_proxy_hash_normals] /= proxy_hash_normal_lengths[valid_proxy_hash_normals, None]
+        proxy_hash_normals[~valid_proxy_hash_normals] = 0.0
         if hasattr(tri_mesh.visual, "uv") and tri_mesh.visual.uv is not None:
             uvs = tri_mesh.visual.uv.astype(np.float32)
             uvs[:, 1] = 1.0 - uvs[:, 1]
@@ -122,6 +141,8 @@ def load_gltf_model(path: str | Path) -> Model:
                 uvs=uvs,
                 indices=tri_mesh.faces.astype(np.uint32),
                 material_index=material_index,
+                proxy_hash_positions=proxy_hash_positions,
+                proxy_hash_normals=proxy_hash_normals.astype(np.float32),
             )
         )
 
