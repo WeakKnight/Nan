@@ -15,6 +15,21 @@ class Material:
     name: str
     base_color: npt.NDArray[np.float32]
     base_color_texture: npt.NDArray[np.float32] | None = None
+    roughness: float = 1.0
+    metallic: float = 0.0
+    base_color_texture_path: Path | None = None
+    metallic_roughness_texture: npt.NDArray[np.float32] | None = None
+    metallic_roughness_texture_path: Path | None = None
+    normal_texture: npt.NDArray[np.float32] | None = None
+    normal_texture_path: Path | None = None
+    normal_scale: float = 1.0
+    occlusion_texture: npt.NDArray[np.float32] | None = None
+    occlusion_texture_path: Path | None = None
+    occlusion_strength: float = 1.0
+    emissive: npt.NDArray[np.float32] | None = None
+    emissive_texture: npt.NDArray[np.float32] | None = None
+    emissive_texture_path: Path | None = None
+    double_sided: bool = False
 
 
 @dataclass
@@ -55,27 +70,72 @@ def _load_gltf_materials(path: Path) -> list[Material]:
     for texture in gltf.textures or []:
         texture_sources.append(texture.source)
 
+    def texture_path(texture_info) -> Path | None:
+        if texture_info is None or texture_info.index is None:
+            return None
+        texture_index = int(texture_info.index)
+        if not 0 <= texture_index < len(texture_sources):
+            return None
+        source_index = texture_sources[texture_index]
+        if source_index is None or not 0 <= source_index < len(image_paths):
+            return None
+        return image_paths[source_index]
+
     materials: list[Material] = []
     for material in gltf.materials or []:
-        base_color = np.array([0.8, 0.8, 0.8, 1.0], dtype=np.float32)
-        texture_data = None
+        base_color = np.ones(4, dtype=np.float32)
+        base_color_path = None
+        roughness = 1.0
+        metallic = 1.0
         pbr = material.pbrMetallicRoughness
         if pbr is not None:
             if pbr.baseColorFactor is not None:
                 base_color = np.asarray(pbr.baseColorFactor, dtype=np.float32)
-            if pbr.baseColorTexture is not None:
-                texture_index = pbr.baseColorTexture.index
-                if texture_index is not None and 0 <= texture_index < len(texture_sources):
-                    source_index = texture_sources[texture_index]
-                    if source_index is not None and 0 <= source_index < len(image_paths):
-                        image_path = image_paths[source_index]
-                        if image_path is not None:
-                            texture_data = _load_image_rgba(image_path)
+            base_color_path = texture_path(pbr.baseColorTexture)
+            if pbr.roughnessFactor is not None:
+                roughness = float(pbr.roughnessFactor)
+            if pbr.metallicFactor is not None:
+                metallic = float(pbr.metallicFactor)
+        metallic_roughness_path = texture_path(pbr.metallicRoughnessTexture if pbr is not None else None)
+        normal_path = texture_path(material.normalTexture)
+        occlusion_path = texture_path(material.occlusionTexture)
+        emissive_path = texture_path(material.emissiveTexture)
+        emissive = np.asarray(
+            material.emissiveFactor if material.emissiveFactor is not None else [0.0, 0.0, 0.0],
+            dtype=np.float32,
+        )
         materials.append(
             Material(
                 name=material.name or f"material_{len(materials)}",
                 base_color=base_color,
-                base_color_texture=texture_data,
+                base_color_texture=_load_image_rgba(base_color_path) if base_color_path is not None else None,
+                roughness=roughness,
+                metallic=metallic,
+                base_color_texture_path=base_color_path,
+                metallic_roughness_texture=(
+                    _load_image_rgba(metallic_roughness_path)
+                    if metallic_roughness_path is not None
+                    else None
+                ),
+                metallic_roughness_texture_path=metallic_roughness_path,
+                normal_texture=_load_image_rgba(normal_path) if normal_path is not None else None,
+                normal_texture_path=normal_path,
+                normal_scale=(
+                    float(material.normalTexture.scale)
+                    if material.normalTexture is not None and material.normalTexture.scale is not None
+                    else 1.0
+                ),
+                occlusion_texture=_load_image_rgba(occlusion_path) if occlusion_path is not None else None,
+                occlusion_texture_path=occlusion_path,
+                occlusion_strength=(
+                    float(material.occlusionTexture.strength)
+                    if material.occlusionTexture is not None and material.occlusionTexture.strength is not None
+                    else 1.0
+                ),
+                emissive=emissive,
+                emissive_texture=_load_image_rgba(emissive_path) if emissive_path is not None else None,
+                emissive_texture_path=emissive_path,
+                double_sided=bool(material.doubleSided),
             )
         )
 

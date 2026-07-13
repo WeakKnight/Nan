@@ -780,7 +780,7 @@ def vertex_visibility_preview_values(
                 cos_theta * (1.0 - aperture_normalized)
                 + (cos_theta * 0.5 + 0.5) * aperture_normalized
             )
-            ambient_visibility = corrected_cos_theta * aperture_normalized * aperture_normalized * cones[:, 4]
+            ambient_visibility = corrected_cos_theta * aperture_normalized * np.clip(encoded[:, 3], 0.0, 1.0)
         ambient_visibility = np.clip(ambient_visibility, 0.0, 1.0)
         values.append(ambient_visibility[:, None].astype(np.float32))
     return values

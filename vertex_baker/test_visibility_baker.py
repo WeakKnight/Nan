@@ -22,6 +22,7 @@ from vertex_baking_utils import (
 )
 from tinybvh_visibility_baker import flatten_model_geometry
 from interactive_viewer import export_visibility_cone_viewer
+from slang_viewer import _vertex_cone_float4, _vertex_value_float4
 from visibility_cone_visualizer import build_visibility_cone_line_segments
 from visibility_baker import (
     HALF_PI,
@@ -33,6 +34,7 @@ from visibility_baker import (
     encode_visibility_cone_texcoord2,
     fit_visibility_cones,
     sample_visibility_cones_python,
+    vertex_visibility_preview_values,
 )
 
 
@@ -111,6 +113,36 @@ class VisibilityBakerTests(unittest.TestCase):
         np.testing.assert_allclose(decoded.directions, directions, atol=2e-6)
         np.testing.assert_allclose(decoded.aperture_radians, apertures, atol=1e-6)
         np.testing.assert_allclose(decoded.scale, scales, atol=1e-6)
+
+    def test_visibility_preview_matches_pmr_ambient_occlusion(self):
+        mesh = _mesh(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [[0, 1, 2]],
+        )
+        aperture_normalized = np.array([0.25, 0.5, 0.8], dtype=np.float32)
+        scale = np.array([0.9, 1.2, 0.6], dtype=np.float32)
+        directions = np.array(
+            [[0.0, 0.0, 1.0], [0.6, 0.0, 0.8], [0.8, 0.0, 0.6]],
+            dtype=np.float32,
+        )
+        cones = np.column_stack((directions, aperture_normalized * HALF_PI, scale)).astype(np.float32)
+        encoded = encode_visibility_cone_texcoord2(
+            directions,
+            cones[:, 3],
+            scale,
+            mesh.normals,
+            compute_mesh_tangents(mesh),
+        )
+        result = type("VisibilityResult", (), {"vertex_cones": [cones], "encoded_texcoord2": [encoded]})()
+
+        actual = vertex_visibility_preview_values(result, _model([mesh]))[0][:, 0]
+        cos_theta = directions[:, 2]
+        corrected_cos_theta = (
+            cos_theta * (1.0 - aperture_normalized)
+            + (cos_theta * 0.5 + 0.5) * aperture_normalized
+        )
+        expected = corrected_cos_theta * aperture_normalized * np.clip(scale, 0.0, 1.0)
+        np.testing.assert_allclose(actual, expected, atol=2e-7)
 
     def test_surface_sampling_can_enforce_minimum_samples_per_mesh(self):
         large_mesh = _mesh(
@@ -315,6 +347,34 @@ class VisibilityBakerTests(unittest.TestCase):
         self.assertAlmostEqual(float(payload["parameters"][1]), 1.8, places=6)
         self.assertIn("gl.drawArraysInstanced", document)
         self.assertIn("updateSelectedConeLines", document)
+
+    def test_slang_viewer_vertex_buffers_preserve_order_and_clamp_pmr_cone(self):
+        mesh0 = _mesh(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [[0, 1, 2]],
+        )
+        mesh1 = _mesh(
+            [[2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0]],
+            [[0, 1, 2]],
+        )
+        model = _model([mesh0, mesh1])
+        values = [
+            np.array([[0.1], [0.2], [0.3]], dtype=np.float32),
+            np.array([[0.4], [0.5], [0.6]], dtype=np.float32),
+        ]
+        cones = [
+            np.tile(np.array([0.0, 0.0, 1.0, 2.0, 1.8], dtype=np.float32), (3, 1)),
+            np.tile(np.array([0.0, 1.0, 0.0, 1.1, 0.4], dtype=np.float32), (3, 1)),
+        ]
+
+        packed_values = _vertex_value_float4(model, values)
+        cone0, cone1 = _vertex_cone_float4(model, cones)
+
+        np.testing.assert_allclose(packed_values[:, 0], np.arange(0.1, 0.7, 0.1), atol=1e-6)
+        np.testing.assert_allclose(packed_values[:, 0], packed_values[:, 1], atol=0.0)
+        np.testing.assert_allclose(cone0[:3, 3], HALF_PI, atol=1e-6)
+        np.testing.assert_allclose(cone0[3:, 3], 1.1, atol=1e-6)
+        np.testing.assert_allclose(cone1[:3, 0], 1.0, atol=1e-6)
 
     def test_pmr_mass_matrix_matches_analytic_triangle_integral(self):
         mesh = _mesh(

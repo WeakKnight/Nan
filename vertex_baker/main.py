@@ -49,7 +49,48 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=("samples", "texture", "vertex-color", "interactive", "visibility"),
         default="samples",
-        help="Preview mode: sample overlay, texture unlit, baked vertex color PNG, interactive vertex color HTML, or visibility reference bake.",
+        help="Preview mode: sample overlay, texture unlit, baked vertex color PNG, native SlangPy viewer, or visibility reference bake.",
+    )
+    parser.add_argument(
+        "--viewer-backend",
+        choices=("native", "html"),
+        default="native",
+        help="Interactive viewer backend. Native uses SlangPy HWRT; html preserves the legacy WebGL export.",
+    )
+    parser.add_argument(
+        "--viewer-data",
+        type=Path,
+        default=None,
+        help="Existing visibility .npz to inspect in interactive mode without rebaking.",
+    )
+    parser.add_argument(
+        "--viewer-max-frames",
+        type=int,
+        default=0,
+        help="Exit the native viewer after N frames; zero runs until the window is closed.",
+    )
+    parser.add_argument(
+        "--viewer-capture-on-exit",
+        action="store_true",
+        help="Write the native viewer output to --output when the viewer exits.",
+    )
+    parser.add_argument(
+        "--envmap",
+        type=Path,
+        default=Path(__file__).resolve().parent / "bloem_field_sunrise_2k.hdr",
+        help="HDR environment map used by the native PBR viewer.",
+    )
+    parser.add_argument("--env-exposure", type=float, default=0.0, help="PBR display exposure in EV.")
+    parser.add_argument(
+        "--env-rotation-degrees",
+        type=float,
+        default=0.0,
+        help="Environment yaw rotation in degrees.",
+    )
+    parser.add_argument(
+        "--no-apply-visibility",
+        action="store_true",
+        help="Do not apply loaded vertex visibility as indirect-light AO.",
     )
     parser.add_argument(
         "--regularization-weight",
@@ -205,6 +246,10 @@ def main() -> None:
 
     if mode == "samples":
         samples = sample_model_surface(model, args.sample_count, args.seed)
+    elif mode == "interactive" and args.viewer_data is not None:
+        from slang_viewer import load_visibility_view_data
+
+        vertex_colors, visibility_cones = load_visibility_view_data(model, args.viewer_data)
     elif mode in ("vertex-color", "interactive"):
         samples_for_bake = sample_model_surface(model, args.sample_count, args.seed)
         sample_values = sample_base_color_values(model, samples_for_bake)
@@ -305,12 +350,44 @@ def main() -> None:
             return
 
     if mode == "interactive":
-        output = args.output
-        if output.suffix.lower() not in (".html", ".htm"):
-            output = output.with_suffix(".html")
-        export_vertex_color_viewer(model, vertex_colors, output)
+        if args.viewer_backend == "html":
+            output = args.output
+            if output.suffix.lower() not in (".html", ".htm"):
+                output = output.with_suffix(".html")
+            if visibility_cones is not None:
+                export_visibility_cone_viewer(
+                    model,
+                    vertex_colors,
+                    visibility_cones,
+                    output,
+                    cone_length=cone_display_length,
+                    rim_segments=max(3, int(args.visibility_cone_rim_segments)),
+                )
+            else:
+                export_vertex_color_viewer(model, vertex_colors, output)
+            print(f"Loaded {len(model.meshes)} meshes from {args.asset}")
+            print(f"Wrote legacy interactive viewer to {output}")
+            return
+
+        from slang_viewer import run_slang_viewer
+
         print(f"Loaded {len(model.meshes)} meshes from {args.asset}")
-        print(f"Wrote interactive vertex color viewer to {output}")
+        print("Starting native SlangPy HWRT viewer")
+        run_slang_viewer(
+            model,
+            vertex_colors,
+            visibility_cones,
+            width=max(1, int(args.width)),
+            height=max(1, int(args.height)),
+            cone_length=cone_display_length,
+            screenshot_path=args.output,
+            max_frames=max(0, int(args.viewer_max_frames)),
+            capture_on_exit=bool(args.viewer_capture_on_exit),
+            environment_path=args.envmap,
+            exposure=float(args.env_exposure),
+            environment_rotation=float(args.env_rotation_degrees),
+            apply_visibility=not bool(args.no_apply_visibility),
+        )
         return
 
     render_unlit_preview(

@@ -14,6 +14,28 @@ from vertex_color_baker import _sample_material_nearest, _vertex_anchor_samples,
 
 
 class VertexBakingUtilsTests(unittest.TestCase):
+    def test_lantern_loads_core_gltf_pbr_material(self):
+        root = Path(__file__).resolve().parents[1]
+        model = load_gltf_model(root / "vertex_baker" / "glTF" / "Lantern.gltf")
+        material = model.materials[0]
+
+        np.testing.assert_array_equal(material.base_color, np.ones(4, dtype=np.float32))
+        np.testing.assert_array_equal(material.emissive, np.ones(3, dtype=np.float32))
+        self.assertEqual(material.roughness, 1.0)
+        self.assertEqual(material.metallic, 1.0)
+        self.assertIsNotNone(material.base_color_texture)
+        self.assertIsNotNone(material.metallic_roughness_texture)
+        self.assertIsNotNone(material.normal_texture)
+        self.assertIsNotNone(material.emissive_texture)
+        self.assertTrue(material.base_color_texture_path.is_file())
+        self.assertTrue(material.metallic_roughness_texture_path.is_file())
+        self.assertTrue(material.normal_texture_path.is_file())
+        self.assertTrue(material.emissive_texture_path.is_file())
+
+        metallic_roughness = material.metallic_roughness_texture
+        self.assertGreater(float(np.ptp(metallic_roughness[:, :, 1])), 0.5)
+        self.assertGreater(float(np.ptp(metallic_roughness[:, :, 2])), 0.5)
+
     @classmethod
     def setUpClass(cls):
         build_native()
