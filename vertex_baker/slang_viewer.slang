@@ -5,7 +5,13 @@ import tone_mapper;
 static const uint INVALID_ID = 0xffffffffu;
 static const uint CONE_RIM_SEGMENTS = 16u;
 
+#ifndef USE_RAY_QUERY
+#define USE_RAY_QUERY 0
+#endif
+
+#if USE_RAY_QUERY
 RaytracingAccelerationStructure g_tlas;
+#endif
 StructuredBuffer<float3> g_positions;
 StructuredBuffer<float3> g_normals;
 StructuredBuffer<float2> g_uvs;
@@ -43,6 +49,21 @@ struct ViewerMaterial
 StructuredBuffer<ViewerMaterial> g_materials;
 SamplerState g_material_sampler;
 
+#if !USE_RAY_QUERY
+uniform float4 g_raster_base_color_factor;
+uniform float3 g_raster_emissive_factor;
+uniform float g_raster_roughness_factor;
+uniform float g_raster_metallic_factor;
+uniform float g_raster_normal_scale;
+uniform float g_raster_occlusion_strength;
+uniform uint g_raster_material_flags;
+Texture2D<float4> g_raster_base_color_texture;
+Texture2D<float4> g_raster_metallic_roughness_texture;
+Texture2D<float4> g_raster_normal_texture;
+Texture2D<float4> g_raster_occlusion_texture;
+Texture2D<float4> g_raster_emissive_texture;
+#endif
+
 RWTexture2D<float4> g_normal_roughness;
 RWTexture2D<float4> g_albedo_metallic;
 RWTexture2D<float4> g_emissive_occlusion;
@@ -64,7 +85,7 @@ float4 interpolate4(float4 v0, float4 v1, float4 v2, float3 bary)
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void gbuffer_main(uint3 tid: SV_DispatchThreadID)
+void clear_gbuffer_main(uint3 tid: SV_DispatchThreadID)
 {
     uint2 pixel = tid.xy;
     uint2 dim;
@@ -80,6 +101,18 @@ void gbuffer_main(uint3 tid: SV_DispatchThreadID)
     g_cone_params[pixel] = float2(0.0, 0.0);
     g_depth[pixel] = 0.0;
     g_ids[pixel] = uint4(INVALID_ID, INVALID_ID, INVALID_ID, 0u);
+}
+
+#if USE_RAY_QUERY
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void gbuffer_main(uint3 tid: SV_DispatchThreadID)
+{
+    uint2 pixel = tid.xy;
+    uint2 dim;
+    g_depth.GetDimensions(dim.x, dim.y);
+    if (any(pixel >= dim))
+        return;
 
     Ray ray = g_camera.compute_ray_pinhole(pixel, dim, false);
     RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
@@ -183,6 +216,145 @@ void gbuffer_main(uint3 tid: SV_DispatchThreadID)
     g_depth[pixel] = max(linear_depth, 0.0);
     g_ids[pixel] = uint4(triangle_id, g_triangle_mesh_ids[triangle_id], nearest_vertex, 1u);
 }
+#endif
+
+struct RasterGBufferVertex
+{
+    float4 position : SV_Position;
+    float3 world_position : TEXCOORD0;
+    float3 normal : TEXCOORD1;
+    float2 uv : TEXCOORD2;
+    float4 baked : TEXCOORD3;
+    float4 cone0 : TEXCOORD4;
+    float cone_scale : TEXCOORD5;
+    float3 bary : TEXCOORD6;
+    nointerpolation uint triangle_id : TEXCOORD7;
+};
+
+struct RasterGBufferOutput
+{
+    float4 normal_roughness : SV_Target0;
+    float4 albedo_metallic : SV_Target1;
+    float4 emissive_occlusion : SV_Target2;
+    float4 baked_value : SV_Target3;
+    float4 visibility_cone : SV_Target4;
+    float2 cone_params : SV_Target5;
+    float linear_depth : SV_Target6;
+    uint4 ids : SV_Target7;
+};
+
+[shader("vertex")]
+RasterGBufferVertex gbuffer_raster_vertex(
+    float3 world_position : POSITION,
+    float3 normal : NORMAL,
+    float2 uv : TEXCOORD0,
+    float4 baked : TEXCOORD1,
+    float4 cone0 : TEXCOORD2,
+    float cone_scale : TEXCOORD3,
+    float3 bary : TEXCOORD4,
+    uint triangle_id : TEXCOORD5)
+{
+    RasterGBufferVertex output;
+    output.position = mul(g_camera.view_proj_matrix_no_jitter, float4(world_position, 1.0));
+    output.world_position = world_position;
+    output.normal = normal;
+    output.uv = uv;
+    output.baked = baked;
+    output.cone0 = cone0;
+    output.cone_scale = cone_scale;
+    output.bary = bary;
+    output.triangle_id = triangle_id;
+    return output;
+}
+
+[shader("fragment")]
+RasterGBufferOutput gbuffer_raster_fragment(RasterGBufferVertex input)
+{
+    uint triangle_id = input.triangle_id;
+    uint i0 = g_indices[triangle_id * 3u + 0u];
+    uint i1 = g_indices[triangle_id * 3u + 1u];
+    uint i2 = g_indices[triangle_id * 3u + 2u];
+
+    float3 view_direction = normalize(g_camera.position - input.world_position);
+    float3 face_normal_value = cross(g_positions[i1] - g_positions[i0], g_positions[i2] - g_positions[i0]);
+    float face_normal_length_squared = dot(face_normal_value, face_normal_value);
+    float3 face_normal = face_normal_length_squared > 1e-12
+        ? face_normal_value * rsqrt(face_normal_length_squared)
+        : float3(0.0, 1.0, 0.0);
+    float normal_length_squared = dot(input.normal, input.normal);
+    float3 normal = normal_length_squared > 1e-12
+        ? input.normal * rsqrt(normal_length_squared)
+        : face_normal;
+    if (dot(normal, view_direction) < 0.0)
+        normal = -normal;
+    if ((g_raster_material_flags & MATERIAL_HAS_NORMAL) != 0u)
+    {
+        float3 dp1 = g_positions[i1] - g_positions[i0];
+        float3 dp2 = g_positions[i2] - g_positions[i0];
+        float2 duv1 = g_uvs[i1] - g_uvs[i0];
+        float2 duv2 = g_uvs[i2] - g_uvs[i0];
+        float determinant = duv1.x * duv2.y - duv1.y * duv2.x;
+        if (abs(determinant) > 1e-7)
+        {
+            float3 tangent = (dp1 * duv2.y - dp2 * duv1.y) / determinant;
+            tangent -= normal * dot(tangent, normal);
+            float tangent_length_squared = dot(tangent, tangent);
+            if (tangent_length_squared > 1e-12)
+            {
+                tangent *= rsqrt(tangent_length_squared);
+                float3 bitangent = cross(normal, tangent);
+                float3 tangent_normal = g_raster_normal_texture.Sample(g_material_sampler, input.uv).xyz * 2.0 - 1.0;
+                tangent_normal.xy *= g_raster_normal_scale;
+                float3 mapped_normal =
+                    tangent * tangent_normal.x + bitangent * tangent_normal.y + normal * tangent_normal.z;
+                float mapped_length_squared = dot(mapped_normal, mapped_normal);
+                if (mapped_length_squared > 1e-12)
+                    normal = mapped_normal * rsqrt(mapped_length_squared);
+            }
+        }
+    }
+
+    float4 base_color = g_raster_base_color_factor;
+    if ((g_raster_material_flags & MATERIAL_HAS_BASE_COLOR) != 0u)
+        base_color *= g_raster_base_color_texture.Sample(g_material_sampler, input.uv);
+    float roughness = g_raster_roughness_factor;
+    float metallic = g_raster_metallic_factor;
+    if ((g_raster_material_flags & MATERIAL_HAS_METALLIC_ROUGHNESS) != 0u)
+    {
+        float4 metallic_roughness = g_raster_metallic_roughness_texture.Sample(g_material_sampler, input.uv);
+        roughness *= metallic_roughness.g;
+        metallic *= metallic_roughness.b;
+    }
+    float3 emissive = g_raster_emissive_factor;
+    if ((g_raster_material_flags & MATERIAL_HAS_EMISSIVE) != 0u)
+        emissive *= g_raster_emissive_texture.Sample(g_material_sampler, input.uv).rgb;
+    float occlusion = 1.0;
+    if ((g_raster_material_flags & MATERIAL_HAS_OCCLUSION) != 0u)
+    {
+        float sampled_occlusion = g_raster_occlusion_texture.Sample(g_material_sampler, input.uv).r;
+        occlusion = lerp(1.0, sampled_occlusion, saturate(g_raster_occlusion_strength));
+    }
+
+    float cone_direction_length_squared = dot(input.cone0.xyz, input.cone0.xyz);
+    float3 cone_direction = cone_direction_length_squared > 1e-12
+        ? input.cone0.xyz * rsqrt(cone_direction_length_squared)
+        : normal;
+    float aperture = input.cone0.w;
+    float3 bary = input.bary;
+    uint nearest_vertex = bary.x >= bary.y && bary.x >= bary.z ? i0 : (bary.y >= bary.z ? i1 : i2);
+    float linear_depth = -mul(g_camera.view_matrix, float4(input.world_position, 1.0)).z;
+
+    RasterGBufferOutput output;
+    output.normal_roughness = float4(normal, saturate(roughness));
+    output.albedo_metallic = float4(max(base_color.rgb, 0.0), saturate(metallic));
+    output.emissive_occlusion = float4(max(emissive, 0.0), saturate(occlusion));
+    output.baked_value = input.baked;
+    output.visibility_cone = float4(cone_direction, saturate(aperture / (0.5 * PI)));
+    output.cone_params = float2(aperture, input.cone_scale);
+    output.linear_depth = max(linear_depth, 0.0);
+    output.ids = uint4(triangle_id, g_triangle_mesh_ids[triangle_id], nearest_vertex, 1u);
+    return output;
+}
 
 Texture2D<uint4> g_pick_ids;
 Texture2D<float> g_pick_depth;
@@ -263,8 +435,8 @@ Texture2D<float4> g_comp_visibility_cone;
 Texture2D<float2> g_comp_cone_params;
 Texture2D<float> g_comp_depth;
 Texture2D<uint4> g_comp_ids;
-TextureCube<float4> g_comp_sky;
-TextureCube<float4> g_comp_specular;
+Texture2DArray<float4> g_comp_sky;
+Texture2DArray<float4> g_comp_specular;
 Texture2D<float2> g_comp_dfg;
 Texture2D<float> g_comp_specular_occlusion;
 StructuredBuffer<float4> g_comp_sh;
@@ -383,7 +555,10 @@ float3 evaluate_pbr_ibl(
     float3 f0 = lerp(float3(0.04), base_color, metallic);
     float3 reflected = rotate_environment(reflect(-view, normal));
     float lod = max(g_specular_mip_count - 1.0, 0.0) * roughness * (2.0 - roughness);
-    float3 prefiltered = g_comp_specular.SampleLevel(g_comp_environment_sampler, reflected, lod).rgb;
+    float3 prefiltered = g_comp_specular.SampleLevel(
+        g_comp_environment_sampler,
+        direction_to_cube_array_uv(reflected),
+        lod).rgb;
     float2 dfg = g_comp_dfg.SampleLevel(g_comp_environment_sampler, float2(no_v, roughness), 0.0);
     float3 diffuse = diffuse_irradiance(normal) * (diffuse_color / PI) * diffuse_visibility;
     float3 specular = prefiltered * (f0 * dfg.x + dfg.y) * specular_visibility;
@@ -529,7 +704,10 @@ void composite_main(uint3 tid: SV_DispatchThreadID)
     bool valid = ids.w != 0u;
     Ray camera_ray = g_comp_camera.compute_ray_pinhole(pixel, dim, false);
     float3 color = g_show_environment != 0u
-        ? g_comp_sky.SampleLevel(g_comp_environment_sampler, rotate_environment(camera_ray.dir), 0.0).rgb
+        ? g_comp_sky.SampleLevel(
+            g_comp_environment_sampler,
+            direction_to_cube_array_uv(rotate_environment(camera_ray.dir)),
+            0.0).rgb
         : float3(0.035, 0.045, 0.055);
     bool tone_map = g_view_mode == 0u;
     if (valid)

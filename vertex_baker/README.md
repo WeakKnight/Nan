@@ -2,7 +2,7 @@
 
 ## Native SlangPy Viewer
 
-The interactive viewer uses Slang compute passes with inline HWRT `RayQuery` to generate a stable GBuffer. Its default PBR view loads core glTF metallic-roughness materials and uses a GPU-generated Filament-style IBL from `bloem_field_sunrise_2k.hdr`.
+The interactive viewer uses inline HWRT `RayQuery` when available and a Slang raster GBuffer fallback on devices such as Metal that do not expose ray queries. Its default PBR view loads core glTF metallic-roughness materials and uses a GPU-generated Filament-style IBL from `bloem_field_sunrise_2k.hdr`.
 
 Inspect an existing visibility bake without rebaking:
 
@@ -26,7 +26,28 @@ Controls:
 
 The PBR controls expose display exposure, environment rotation/background, and optional PMR visibility-cone occlusion. The cone contributes separate per-pixel diffuse AO and view-dependent specular occlusion; material AO remains diffuse-only. Use `--no-apply-visibility` to disable both cone terms in automated captures. The `PMR diffuse AO` and `PMR specular occlusion` views inspect the evaluated terms directly.
 
-Use `--viewer-backend html` to preserve the legacy HTML export. `--viewer-max-frames N` and `--viewer-capture-on-exit` are useful for automated GPU smoke tests.
+`--viewer-max-frames N` and `--viewer-capture-on-exit` are useful for automated GPU smoke tests.
+
+### macOS
+
+The native Slang viewer automatically uses its raster GBuffer when the Metal backend does not expose `ray_query`. Visibility baking itself can use the portable TinyBVH backend before launching the native viewer:
+
+```bash
+python vertex_baker/main.py \
+  --mode visibility \
+  --asset vertex_baker/glTF/Lantern.gltf \
+  --output vertex_baker/out/lantern_visibility.npz \
+  --visibility-trace-backend tinybvh \
+  --build-native
+
+python vertex_baker/main.py \
+  --mode interactive \
+  --asset vertex_baker/glTF/Lantern.gltf \
+  --viewer-data vertex_baker/out/lantern_visibility.npz \
+  --envmap vertex_baker/bloem_field_sunrise_2k.hdr
+```
+
+This remains the native SlangPy window: IBL generation, PBR composite, debug views, cone overlay, GPU picking, and UI all run through Slang/Metal. Only the primary-surface GBuffer changes from inline ray query to rasterization.
 
 ## GBuffer
 

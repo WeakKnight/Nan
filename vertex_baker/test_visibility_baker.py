@@ -1,7 +1,4 @@
-import json
-import re
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -21,7 +18,6 @@ from vertex_baking_utils import (
     trace_pmr_visibility_sh_tinybvh,
 )
 from tinybvh_visibility_baker import flatten_model_geometry
-from interactive_viewer import export_visibility_cone_viewer
 from slang_viewer import _vertex_cone_float4, _vertex_value_float4
 from visibility_cone_visualizer import build_visibility_cone_line_segments
 from visibility_baker import (
@@ -312,41 +308,6 @@ class VisibilityBakerTests(unittest.TestCase):
         np.testing.assert_allclose(lines.ends[0], np.array([0.0, 0.0, 1.0]), atol=1e-7)
         np.testing.assert_allclose(lines.ends[1], np.array([1.0, 0.0, 0.0]), atol=1e-6)
         self.assertEqual(int(lines.widths[0]), 2)
-
-    def test_interactive_visibility_cone_viewer_embeds_line_geometry(self):
-        mesh = _mesh(
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            [[0, 1, 2]],
-        )
-        model = _model([mesh])
-        colors = [np.full((3, 1), 0.5, dtype=np.float32)]
-        cones = [
-            np.tile(
-                np.array([0.0, 0.0, 1.0, np.pi * 0.25, 1.8], dtype=np.float32),
-                (3, 1),
-            )
-        ]
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "cones.html"
-            export_visibility_cone_viewer(model, colors, cones, output, cone_length=0.2, rim_segments=4)
-            document = output.read_text(encoding="utf-8")
-
-        self.assertIn("Vertex Visibility Cones", document)
-        self.assertIn('id="cone-all"', document)
-        self.assertIn('id="cone-surface"', document)
-        self.assertIn('id="cone-wire"', document)
-        self.assertIn('id="cone-xray"', document)
-        self.assertIn('id="cone-diagram"', document)
-        self.assertNotIn('const coneLineData = {"positions":[],"colors":[]}', document)
-        payload_match = re.search(r"const coneInstanceData = (.*);", document)
-        self.assertIsNotNone(payload_match)
-        payload = json.loads(payload_match.group(1))
-        self.assertEqual(len(payload["positions"]), 9)
-        self.assertAlmostEqual(float(payload["length"]), 0.2, places=7)
-        self.assertAlmostEqual(float(payload["parameters"][0]), np.pi * 0.25, places=6)
-        self.assertAlmostEqual(float(payload["parameters"][1]), 1.8, places=6)
-        self.assertIn("gl.drawArraysInstanced", document)
-        self.assertIn("updateSelectedConeLines", document)
 
     def test_slang_viewer_vertex_buffers_preserve_order_and_clamp_pmr_cone(self):
         mesh0 = _mesh(

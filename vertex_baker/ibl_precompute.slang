@@ -7,9 +7,12 @@ static const uint SPECULAR_OCCLUSION_SAMPLE_COUNT = 256u;
 static const float MIN_LINEAR_ROUGHNESS = 0.089;
 
 Texture2D<float4> g_env_equirect;
-TextureCube<float4> g_env_sky;
+Texture2DArray<float4> g_env_sky;
 SamplerState g_env_sampler;
-RWTexture2D<float4> g_env_output;
+// Bind the complete six-layer cubemap mip when writing.  A one-face view of a
+// cube is accepted by D3D12, but Metal requires cube views to contain a
+// multiple of six slices.
+RWTexture2DArray<float4> g_env_output;
 RWTexture2D<float2> g_dfg_output;
 RWTexture2D<float> g_specular_occlusion_output;
 RWStructuredBuffer<float4> g_sh_output;
@@ -35,17 +38,23 @@ float2 wrapped_equirect_uv(float3 direction)
     return float2(frac(uv.x), saturate(uv.y));
 }
 
+float4 sample_sky(float3 direction, float lod)
+{
+    return g_env_sky.SampleLevel(g_env_sampler, direction_to_cube_array_uv(direction), lod);
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void equirect_to_cube_main(uint3 tid: SV_DispatchThreadID)
 {
     uint2 dim;
-    g_env_output.GetDimensions(dim.x, dim.y);
+    uint layer_count;
+    g_env_output.GetDimensions(dim.x, dim.y, layer_count);
     if (any(tid.xy >= dim))
         return;
     float2 uv = (float2(tid.xy) + 0.5) / float2(dim);
     float3 direction = cubemap_direction(g_env_face, uv);
-    g_env_output[tid.xy] = float4(g_env_equirect.SampleLevel(g_env_sampler, wrapped_equirect_uv(direction), 0.0).rgb, 1.0);
+    g_env_output[uint3(tid.xy, g_env_face)] = float4(g_env_equirect.SampleLevel(g_env_sampler, wrapped_equirect_uv(direction), 0.0).rgb, 1.0);
 }
 
 [shader("compute")]
@@ -53,12 +62,13 @@ void equirect_to_cube_main(uint3 tid: SV_DispatchThreadID)
 void downsample_cube_main(uint3 tid: SV_DispatchThreadID)
 {
     uint2 dim;
-    g_env_output.GetDimensions(dim.x, dim.y);
+    uint layer_count;
+    g_env_output.GetDimensions(dim.x, dim.y, layer_count);
     if (any(tid.xy >= dim))
         return;
     float2 uv = (float2(tid.xy) + 0.5) / float2(dim);
     float3 direction = cubemap_direction(g_env_face, uv);
-    g_env_output[tid.xy] = float4(g_env_sky.SampleLevel(g_env_sampler, direction, g_env_source_lod).rgb, 1.0);
+    g_env_output[uint3(tid.xy, g_env_face)] = float4(sample_sky(direction, g_env_source_lod).rgb, 1.0);
 }
 
 float radical_inverse(uint bits)
@@ -107,14 +117,15 @@ float d_ggx(float no_h, float perceptual_roughness)
 void prefilter_specular_main(uint3 tid: SV_DispatchThreadID)
 {
     uint2 dim;
-    g_env_output.GetDimensions(dim.x, dim.y);
+    uint layer_count;
+    g_env_output.GetDimensions(dim.x, dim.y, layer_count);
     if (any(tid.xy >= dim))
         return;
     float2 uv = (float2(tid.xy) + 0.5) / float2(dim);
     float3 normal = cubemap_direction(g_env_face, uv);
     if (g_env_roughness <= 1e-5)
     {
-        g_env_output[tid.xy] = float4(g_env_sky.SampleLevel(g_env_sampler, normal, 0.0).rgb, 1.0);
+        g_env_output[uint3(tid.xy, g_env_face)] = float4(sample_sky(normal, 0.0).rgb, 1.0);
         return;
     }
 
@@ -134,10 +145,10 @@ void prefilter_specular_main(uint3 tid: SV_DispatchThreadID)
         float pdf = max(d_ggx(no_h, g_env_roughness) * no_h / max(4.0 * vo_h, 1e-5), 1e-5);
         float sample_solid_angle = 1.0 / (float(PREFILTER_SAMPLE_COUNT) * pdf);
         float source_lod = max(0.5 * log2(sample_solid_angle / texel_solid_angle), 0.0);
-        radiance += g_env_sky.SampleLevel(g_env_sampler, light, source_lod).rgb * no_l;
+        radiance += sample_sky(light, source_lod).rgb * no_l;
         weight += no_l;
     }
-    g_env_output[tid.xy] = float4(radiance / max(weight, 1e-5), 1.0);
+    g_env_output[uint3(tid.xy, g_env_face)] = float4(radiance / max(weight, 1e-5), 1.0);
 }
 
 float geometry_dfg(float no_v, float no_l, float perceptual_roughness)
@@ -253,7 +264,7 @@ float integrate_pmr_specular_occlusion(float aperture, float cos_beta, float rou
         accumulated_visibility += visible * sample_weight;
         accumulated_weight += sample_weight;
     }
-    return accumulated_weight > 0.0 ? accumulated_visibility / accumulated_weight : 0.0;
+    return accumulated_weight > 0.0 ? saturate(accumulated_visibility / accumulated_weight) : 0.0;
 }
 
 [shader("compute")]

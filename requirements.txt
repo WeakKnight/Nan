@@ -2,5 +2,6 @@ slangpy
 numpy
 trimesh
 OpenEXR
+Pillow
 event-dispatching
 pygltflib

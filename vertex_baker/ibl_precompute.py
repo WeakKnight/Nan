@@ -17,8 +17,14 @@ class EnvironmentIBL:
     DFG_SIZE = 128
     SPECULAR_OCCLUSION_SIZE = 16
 
-    def __init__(self, device: spy.Device, path: str | Path) -> None:
+    def __init__(
+        self,
+        device: spy.Device,
+        path: str | Path,
+        shader_session: spy.SlangSession | None = None,
+    ) -> None:
         self.device = device
+        self.shader_session = shader_session or device.slang_session
         self.path = Path(path).resolve()
         if not self.path.is_file():
             raise FileNotFoundError(f"Environment map not found: {self.path}")
@@ -51,19 +57,21 @@ class EnvironmentIBL:
             | spy.TextureUsage.render_target
         )
         self.sky = device.create_texture(
-            type=spy.TextureType.texture_cube,
+            type=spy.TextureType.texture_2d_array,
             format=spy.Format.rgba16_float,
             width=self.SKY_SIZE,
             height=self.SKY_SIZE,
+            array_length=6,
             mip_count=spy.ALL_MIPS,
             usage=cube_usage,
             label="baker_ibl_sky",
         )
         self.specular = device.create_texture(
-            type=spy.TextureType.texture_cube,
+            type=spy.TextureType.texture_2d_array,
             format=spy.Format.rgba16_float,
             width=self.SPECULAR_SIZE,
             height=self.SPECULAR_SIZE,
+            array_length=6,
             mip_count=self.SPECULAR_MIPS,
             usage=cube_usage,
             label="baker_ibl_specular",
@@ -88,9 +96,9 @@ class EnvironmentIBL:
             label="baker_ibl_sh9",
         )
 
-        self._module = device.load_module(str(SHADER_PATH))
+        self._module = self.shader_session.load_module(str(SHADER_PATH))
         self._pipelines = {
-            name: device.create_compute_pipeline(device.load_program(str(SHADER_PATH), [name]))
+            name: device.create_compute_pipeline(self.shader_session.load_program(str(SHADER_PATH), [name]))
             for name in (
                 "equirect_to_cube_main",
                 "downsample_cube_main",
@@ -132,7 +140,7 @@ class EnvironmentIBL:
             self._dispatch_face(
                 encoder,
                 self._pipelines["equirect_to_cube_main"],
-                self.sky.create_view(layer=face, layer_count=1, mip=0, mip_count=1),
+                self.sky.create_view(layer=0, layer_count=6, mip=0, mip_count=1),
                 self.SKY_SIZE,
                 face,
                 g_env_equirect=self.equirect,
@@ -144,7 +152,7 @@ class EnvironmentIBL:
                 self._dispatch_face(
                     encoder,
                     self._pipelines["downsample_cube_main"],
-                    self.sky.create_view(layer=face, layer_count=1, mip=mip, mip_count=1),
+                    self.sky.create_view(layer=0, layer_count=6, mip=mip, mip_count=1),
                     size,
                     face,
                     g_env_sky=self.sky,
@@ -160,7 +168,7 @@ class EnvironmentIBL:
                 self._dispatch_face(
                     encoder,
                     self._pipelines["prefilter_specular_main"],
-                    self.specular.create_view(layer=face, layer_count=1, mip=mip, mip_count=1),
+                    self.specular.create_view(layer=0, layer_count=6, mip=mip, mip_count=1),
                     size,
                     face,
                     g_env_sky=self.sky,

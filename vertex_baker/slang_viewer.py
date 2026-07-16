@@ -116,6 +116,8 @@ class BakerRTScene:
         model: Model,
         vertex_values: list[npt.NDArray[np.float32]] | None = None,
         vertex_cones: list[npt.NDArray[np.float32]] | None = None,
+        shader_session: spy.SlangSession | None = None,
+        use_ray_query: bool = True,
     ) -> None:
         if vertex_values is not None and len(vertex_values) != len(model.meshes):
             raise ValueError("vertex_values must contain one array per mesh")
@@ -123,6 +125,8 @@ class BakerRTScene:
             raise ValueError("vertex_cones must contain one array per mesh")
 
         self.device = device
+        self.shader_session = shader_session or device.slang_session
+        self.use_ray_query = bool(use_ray_query)
         self.model = model
         self.has_cones = vertex_cones is not None
         position_parts = []
@@ -164,6 +168,42 @@ class BakerRTScene:
         self.vertex_cone0, self.vertex_cone1 = _vertex_cone_float4(model, vertex_cones)
         self.bounds_min = np.asarray(model.bounds_min, dtype=np.float32)
         self.bounds_max = np.asarray(model.bounds_max, dtype=np.float32)
+
+        raster_vertex_dtype = np.dtype(
+            [
+                ("position", np.float32, 3),
+                ("normal", np.float32, 3),
+                ("uv", np.float32, 2),
+                ("baked", np.float32, 4),
+                ("cone0", np.float32, 4),
+                ("cone_scale", np.float32),
+                ("bary", np.float32, 3),
+                ("triangle_id", np.uint32),
+            ],
+            align=False,
+        )
+        raster_vertices = np.empty(self.indices.shape[0], dtype=raster_vertex_dtype)
+        raster_vertices["position"] = self.positions[self.indices]
+        raster_vertices["normal"] = self.normals[self.indices]
+        raster_vertices["uv"] = self.uvs[self.indices]
+        raster_vertices["baked"] = self.vertex_values[self.indices]
+        raster_vertices["cone0"] = self.vertex_cone0[self.indices]
+        raster_vertices["cone_scale"] = self.vertex_cone1[self.indices, 0]
+        raster_vertices["bary"] = np.tile(np.eye(3, dtype=np.float32), (self.indices.shape[0] // 3, 1))
+        raster_vertices["triangle_id"] = np.repeat(
+            np.arange(self.indices.shape[0] // 3, dtype=np.uint32),
+            3,
+        )
+        self.raster_vertex_stride = raster_vertex_dtype.itemsize
+        self.raster_vertex_offsets = {
+            name: int(raster_vertex_dtype.fields[name][1])
+            for name in raster_vertex_dtype.names or ()
+        }
+        self.raster_vertex_buffer = device.create_buffer(
+            usage=spy.BufferUsage.vertex_buffer,
+            label="baker_viewer_raster_vertices",
+            data=np.ascontiguousarray(raster_vertices).view(np.uint8),
+        )
 
         self.position_buffer = device.create_buffer(
             usage=spy.BufferUsage.shader_resource,
@@ -212,6 +252,7 @@ class BakerRTScene:
         self._material_texture_cache: dict[tuple[str, bool], spy.TextureView] = {}
         self.material_textures: list[spy.Texture] = []
         self.material_texture_views: list[spy.TextureView] = []
+        self.raster_material_bindings: list[dict[str, object]] = []
         self.material_buffer = self._create_material_buffer()
         self.value_buffer = device.create_buffer(
             usage=spy.BufferUsage.shader_resource,
@@ -335,7 +376,7 @@ class BakerRTScene:
         return view
 
     def _create_material_buffer(self) -> spy.Buffer:
-        module = self.device.load_module(str(SHADER_PATH))
+        module = self.shader_session.load_module(str(SHADER_PATH))
         buffer_type = module.layout.find_type_by_name("StructuredBuffer<ViewerMaterial>")
         if buffer_type is None:
             raise RuntimeError("Could not reflect ViewerMaterial from slang_viewer.slang")
@@ -389,6 +430,25 @@ class BakerRTScene:
             flags |= 1 << 3 if material.occlusion_texture is not None else 0
             flags |= 1 << 4 if material.emissive_texture is not None else 0
             flags |= 1 << 5 if material.double_sided else 0
+            self.raster_material_bindings.append(
+                {
+                    "base_color_factor": np.asarray(material.base_color, dtype=np.float32),
+                    "emissive_factor": np.asarray(
+                        material.emissive if material.emissive is not None else [0.0, 0.0, 0.0],
+                        dtype=np.float32,
+                    ),
+                    "roughness_factor": float(material.roughness),
+                    "metallic_factor": float(material.metallic),
+                    "normal_scale": float(material.normal_scale),
+                    "occlusion_strength": float(material.occlusion_strength),
+                    "flags": flags,
+                    "base_color_texture": base_view,
+                    "metallic_roughness_texture": mr_view,
+                    "normal_texture": normal_view,
+                    "occlusion_texture": occlusion_view,
+                    "emissive_texture": emissive_view,
+                }
+            )
             entry = cursor[material_index]
             entry.base_color_factor = spy.float4(np.asarray(material.base_color, dtype=np.float32))
             entry.emissive_factor = spy.float3(
@@ -408,7 +468,8 @@ class BakerRTScene:
         return buffer
 
     def bind_gbuffer(self, cursor: spy.ShaderCursor) -> None:
-        cursor.g_tlas = self.tlas
+        if self.use_ray_query:
+            cursor.g_tlas = self.tlas
         cursor.g_positions = self.position_buffer
         cursor.g_normals = self.normal_buffer
         cursor.g_uvs = self.uv_buffer
@@ -420,6 +481,21 @@ class BakerRTScene:
         cursor.g_vertex_values = self.value_buffer
         cursor.g_vertex_cone0 = self.cone0_buffer
         cursor.g_vertex_cone1 = self.cone1_buffer
+
+    def bind_raster_material(self, cursor: spy.ShaderCursor, material_index: int) -> None:
+        material = self.raster_material_bindings[material_index]
+        cursor.g_raster_base_color_factor = spy.float4(material["base_color_factor"])
+        cursor.g_raster_emissive_factor = spy.float3(material["emissive_factor"])
+        cursor.g_raster_roughness_factor = material["roughness_factor"]
+        cursor.g_raster_metallic_factor = material["metallic_factor"]
+        cursor.g_raster_normal_scale = material["normal_scale"]
+        cursor.g_raster_occlusion_strength = material["occlusion_strength"]
+        cursor.g_raster_material_flags = material["flags"]
+        cursor.g_raster_base_color_texture = material["base_color_texture"]
+        cursor.g_raster_metallic_roughness_texture = material["metallic_roughness_texture"]
+        cursor.g_raster_normal_texture = material["normal_texture"]
+        cursor.g_raster_occlusion_texture = material["occlusion_texture"]
+        cursor.g_raster_emissive_texture = material["emissive_texture"]
 
     def selected_data(self, global_vertex_id: int) -> dict[str, object] | None:
         if global_vertex_id < 0 or global_vertex_id >= self.positions.shape[0]:
@@ -459,17 +535,77 @@ class ViewerTextures:
     cone_params: spy.Texture
     depth: spy.Texture
     ids: spy.Texture
+    raster_depth: spy.Texture
     output: spy.Texture
 
 
 class BakerViewerPasses:
-    def __init__(self, device: spy.Device) -> None:
+    def __init__(
+        self,
+        device: spy.Device,
+        shader_session: spy.SlangSession | None = None,
+        use_ray_query: bool = True,
+    ) -> None:
         self.device = device
-        self.gbuffer_program = device.load_program(str(SHADER_PATH), ["gbuffer_main"])
-        self.gbuffer_pipeline = device.create_compute_pipeline(self.gbuffer_program)
-        self.composite_program = device.load_program(str(SHADER_PATH), ["composite_main"])
+        self.shader_session = shader_session or device.slang_session
+        self.use_ray_query = bool(use_ray_query)
+        self.clear_program = self.shader_session.load_program(str(SHADER_PATH), ["clear_gbuffer_main"])
+        self.clear_pipeline = device.create_compute_pipeline(self.clear_program)
+        if self.use_ray_query:
+            self.gbuffer_program = self.shader_session.load_program(str(SHADER_PATH), ["gbuffer_main"])
+            self.gbuffer_pipeline = device.create_compute_pipeline(self.gbuffer_program)
+            self.gbuffer_raster_pipeline = None
+        else:
+            self.gbuffer_program = self.shader_session.load_program(
+                str(SHADER_PATH),
+                ["gbuffer_raster_vertex", "gbuffer_raster_fragment"],
+            )
+            self.gbuffer_input_layout = device.create_input_layout(
+                [
+                    {"semantic_name": "POSITION", "format": spy.Format.rgb32_float, "offset": 0},
+                    {"semantic_name": "NORMAL", "format": spy.Format.rgb32_float, "offset": 12},
+                    {"semantic_name": "TEXCOORD", "semantic_index": 0, "format": spy.Format.rg32_float, "offset": 24},
+                    {"semantic_name": "TEXCOORD", "semantic_index": 1, "format": spy.Format.rgba32_float, "offset": 32},
+                    {"semantic_name": "TEXCOORD", "semantic_index": 2, "format": spy.Format.rgba32_float, "offset": 48},
+                    {"semantic_name": "TEXCOORD", "semantic_index": 3, "format": spy.Format.r32_float, "offset": 64},
+                    {"semantic_name": "TEXCOORD", "semantic_index": 4, "format": spy.Format.rgb32_float, "offset": 68},
+                    {"semantic_name": "TEXCOORD", "semantic_index": 5, "format": spy.Format.r32_uint, "offset": 80},
+                ],
+                [{"stride": 84}],
+            )
+            target_formats = (
+                spy.Format.rgba16_float,
+                spy.Format.rgba16_float,
+                spy.Format.rgba16_float,
+                spy.Format.rgba16_float,
+                spy.Format.rgba16_float,
+                spy.Format.rg16_float,
+                spy.Format.r32_float,
+                spy.Format.rgba32_uint,
+            )
+            self.gbuffer_raster_pipeline = device.create_render_pipeline(
+                self.gbuffer_program,
+                self.gbuffer_input_layout,
+                primitive_topology=spy.PrimitiveTopology.triangle_list,
+                targets=[{"format": format} for format in target_formats],
+                depth_stencil={
+                    "format": spy.Format.d32_float,
+                    "depth_test_enable": True,
+                    "depth_write_enable": True,
+                    "depth_func": spy.ComparisonFunc.less,
+                },
+                rasterizer={
+                    "fill_mode": spy.FillMode.solid,
+                    "cull_mode": spy.CullMode.none,
+                    "front_face": spy.FrontFaceMode.counter_clockwise,
+                    "depth_clip_enable": True,
+                },
+                label="baker_viewer_raster_gbuffer",
+            )
+            self.gbuffer_pipeline = None
+        self.composite_program = self.shader_session.load_program(str(SHADER_PATH), ["composite_main"])
         self.composite_pipeline = device.create_compute_pipeline(self.composite_program)
-        self.pick_program = device.load_program(str(SHADER_PATH), ["pick_main"])
+        self.pick_program = self.shader_session.load_program(str(SHADER_PATH), ["pick_main"])
         self.pick_pipeline = device.create_compute_pipeline(self.pick_program)
         self.pick_buffer = device.create_buffer(
             size=16,
@@ -478,7 +614,11 @@ class BakerViewerPasses:
         )
 
     def create_textures(self, width: int, height: int) -> ViewerTextures:
-        usage = spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access
+        usage = (
+            spy.TextureUsage.shader_resource
+            | spy.TextureUsage.unordered_access
+            | spy.TextureUsage.render_target
+        )
 
         def texture(format: spy.Format, label: str) -> spy.Texture:
             return self.device.create_texture(
@@ -500,8 +640,26 @@ class BakerViewerPasses:
             cone_params=texture(spy.Format.rg16_float, "baker_gbuffer_cone_params"),
             depth=texture(spy.Format.r32_float, "baker_gbuffer_depth"),
             ids=texture(spy.Format.rgba32_uint, "baker_gbuffer_ids"),
+            raster_depth=self.device.create_texture(
+                format=spy.Format.d32_float,
+                width=width,
+                height=height,
+                usage=spy.TextureUsage.depth_stencil,
+                label="baker_gbuffer_raster_depth",
+            ),
             output=texture(spy.Format.rgba32_float, "baker_viewer_output"),
         )
+
+    @staticmethod
+    def _bind_gbuffer_textures(cursor: spy.ShaderCursor, textures: ViewerTextures) -> None:
+        cursor.g_normal_roughness = textures.normal_roughness
+        cursor.g_albedo_metallic = textures.albedo_metallic
+        cursor.g_emissive_occlusion = textures.emissive_occlusion
+        cursor.g_baked_value = textures.baked_value
+        cursor.g_visibility_cone = textures.visibility_cone
+        cursor.g_cone_params = textures.cone_params
+        cursor.g_depth = textures.depth
+        cursor.g_ids = textures.ids
 
     def encode_gbuffer(
         self,
@@ -511,19 +669,73 @@ class BakerViewerPasses:
         textures: ViewerTextures,
     ) -> None:
         with command_encoder.begin_compute_pass() as pass_encoder:
-            shader_object = pass_encoder.bind_pipeline(self.gbuffer_pipeline)
+            shader_object = pass_encoder.bind_pipeline(self.clear_pipeline)
+            cursor = spy.ShaderCursor(shader_object)
+            self._bind_gbuffer_textures(cursor, textures)
+            pass_encoder.dispatch(thread_count=[textures.width, textures.height, 1])
+
+        if self.use_ray_query:
+            assert self.gbuffer_pipeline is not None
+            with command_encoder.begin_compute_pass() as pass_encoder:
+                shader_object = pass_encoder.bind_pipeline(self.gbuffer_pipeline)
+                cursor = spy.ShaderCursor(shader_object)
+                scene.bind_gbuffer(cursor)
+                camera.bind(cursor.g_camera)
+                self._bind_gbuffer_textures(cursor, textures)
+                pass_encoder.dispatch(thread_count=[textures.width, textures.height, 1])
+            return
+
+        assert self.gbuffer_raster_pipeline is not None
+        color_textures = (
+            textures.normal_roughness,
+            textures.albedo_metallic,
+            textures.emissive_occlusion,
+            textures.baked_value,
+            textures.visibility_cone,
+            textures.cone_params,
+            textures.depth,
+            textures.ids,
+        )
+        render_pass = {
+            "color_attachments": [
+                {
+                    "view": texture.create_view(),
+                    "load_op": spy.LoadOp.load,
+                    "store_op": spy.StoreOp.store,
+                }
+                for texture in color_textures
+            ],
+            "depth_stencil_attachment": {
+                "view": textures.raster_depth.create_view(),
+                "depth_load_op": spy.LoadOp.clear,
+                "depth_store_op": spy.StoreOp.dont_care,
+                "depth_clear_value": 1.0,
+            },
+        }
+        with command_encoder.begin_render_pass(render_pass) as pass_encoder:
+            shader_object = pass_encoder.bind_pipeline(self.gbuffer_raster_pipeline)
             cursor = spy.ShaderCursor(shader_object)
             scene.bind_gbuffer(cursor)
             camera.bind(cursor.g_camera)
-            cursor.g_normal_roughness = textures.normal_roughness
-            cursor.g_albedo_metallic = textures.albedo_metallic
-            cursor.g_emissive_occlusion = textures.emissive_occlusion
-            cursor.g_baked_value = textures.baked_value
-            cursor.g_visibility_cone = textures.visibility_cone
-            cursor.g_cone_params = textures.cone_params
-            cursor.g_depth = textures.depth
-            cursor.g_ids = textures.ids
-            pass_encoder.dispatch(thread_count=[textures.width, textures.height, 1])
+            pass_encoder.set_render_state(
+                {
+                    "viewports": [spy.Viewport.from_size(textures.width, textures.height)],
+                    "scissor_rects": [spy.ScissorRect.from_size(textures.width, textures.height)],
+                    "vertex_buffers": [scene.raster_vertex_buffer],
+                }
+            )
+            start_vertex = 0
+            for mesh in scene.model.meshes:
+                vertex_count = int(mesh.indices.size)
+                scene.bind_raster_material(cursor, mesh.material_index)
+                pass_encoder.draw(
+                    {
+                        "vertex_count": vertex_count,
+                        "instance_count": 1,
+                        "start_vertex_location": start_vertex,
+                    }
+                )
+                start_vertex += vertex_count
 
     def encode_pick(
         self,
@@ -616,7 +828,8 @@ class OrbitCameraController:
         self.bounds_min = np.asarray(bounds_min, dtype=np.float32)
         self.bounds_max = np.asarray(bounds_max, dtype=np.float32)
         self.radius = max(float(np.linalg.norm(self.bounds_max - self.bounds_min) * 0.5), 1e-3)
-        self.center = (self.bounds_min + self.bounds_max) * 0.5
+        self.bounds_center = (self.bounds_min + self.bounds_max) * 0.5
+        self.center = self.bounds_center.copy()
         self.yaw = 0.08
         self.pitch = 0.02
         self.distance = self.radius * 3.0
@@ -628,7 +841,7 @@ class OrbitCameraController:
         self.update_camera()
 
     def reset(self) -> None:
-        self.center = (self.bounds_min + self.bounds_max) * 0.5
+        self.center = self.bounds_center.copy()
         self.yaw = 0.08
         self.pitch = 0.02
         self.distance = self.radius * 3.0
@@ -644,8 +857,17 @@ class OrbitCameraController:
         self.camera.position = spy.float3(position)
         self.camera.target = spy.float3(self.center)
         self.camera.up = spy.float3(0.0, 1.0, 0.0)
-        self.camera.near_clip_plane = max(self.radius * 1e-4, 1e-5)
-        self.camera.far_clip_plane = self.radius * 50.0
+        distance_to_bounds_center = float(np.linalg.norm(position - self.bounds_center))
+        bounds_padding = self.radius * 1.05
+        self.camera.near_clip_plane = max(
+            distance_to_bounds_center - bounds_padding,
+            self.radius * 1e-3,
+            1e-5,
+        )
+        self.camera.far_clip_plane = max(
+            distance_to_bounds_center + bounds_padding,
+            self.camera.near_clip_plane + self.radius * 0.1,
+        )
         self.camera.focal_distance = 1.0
         self.camera.fov = 45.0
         self.camera.recompute()
@@ -716,7 +938,8 @@ class VertexBakerSlangViewer:
         environment_rotation: float = 0.0,
         apply_visibility: bool = True,
     ) -> None:
-        self.window = spy.Window(width=max(1, width), height=max(1, height), title="Vertex Baker", resizable=True)
+        resolved_environment_path = Path(environment_path).resolve()
+        resolved_screenshot_path = Path(screenshot_path).resolve()
         self.device = spy.Device(
             enable_debug_layers=False,
             enable_print=True,
@@ -725,12 +948,39 @@ class VertexBakerSlangViewer:
                 "defines": {"USE_RAYTRACING_PIPELINE": "0", "HEADLESS_MODE": "0"},
             },
         )
+        self.use_ray_query = self.device.has_feature(spy.Feature.ray_query)
+        self.shader_session = self.device.create_slang_session(
+            compiler_options={
+                "include_paths": [ROOT, VERTEX_BAKER_DIR],
+                "defines": {
+                    "USE_RAYTRACING_PIPELINE": "0",
+                    "HEADLESS_MODE": "0",
+                    "USE_RAY_QUERY": "1" if self.use_ray_query else "0",
+                },
+            }
+        )
+        self.window = spy.Window(width=max(1, width), height=max(1, height), title="Vertex Baker", resizable=True)
         self.surface = self.device.create_surface(self.window)
         self.surface.configure(width=self.window.width, height=self.window.height, vsync=False)
         self.ui = spy.ui.Context(self.device)
-        self.environment = EnvironmentIBL(self.device, environment_path)
-        self.scene = BakerRTScene(self.device, model, vertex_values, vertex_cones)
-        self.passes = BakerViewerPasses(self.device)
+        self.environment = EnvironmentIBL(self.device, resolved_environment_path, self.shader_session)
+        self.scene = BakerRTScene(
+            self.device,
+            model,
+            vertex_values,
+            vertex_cones,
+            shader_session=self.shader_session,
+            use_ray_query=self.use_ray_query,
+        )
+        self.passes = BakerViewerPasses(
+            self.device,
+            self.shader_session,
+            use_ray_query=self.use_ray_query,
+        )
+        print(
+            "Vertex baker GBuffer: "
+            + ("inline ray query" if self.use_ray_query else "raster fallback")
+        )
         self.camera = Camera()
         self.orbit = OrbitCameraController(self.camera, self.scene.bounds_min, self.scene.bounds_max)
         self.textures: ViewerTextures | None = None
@@ -738,7 +988,7 @@ class VertexBakerSlangViewer:
         self.selected_vertex = self.scene.initial_vertex()
         self.last_pick_distance: float | None = None
         self.cone_length = max(float(cone_length), 1e-6)
-        self.screenshot_path = Path(screenshot_path)
+        self.screenshot_path = resolved_screenshot_path
         self.max_frames = max(0, int(max_frames))
         self.capture_on_exit = bool(capture_on_exit)
 

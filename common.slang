@@ -392,6 +392,54 @@ float2 direction_to_equirect_uv(float3 normalizedDirection)
     return uv;
 }
 
+// Maps a cubemap direction to (u, v, array layer). Using a six-layer
+// Texture2DArray keeps compute writes portable to Metal, where writable
+// single-face cubemap views are not supported.
+float3 direction_to_cube_array_uv(float3 direction)
+{
+    float3 d = normalize(direction);
+    float3 ad = abs(d);
+    float2 p;
+    uint face;
+    if (ad.x >= ad.y && ad.x >= ad.z)
+    {
+        if (d.x >= 0.0)
+        {
+            face = 0u;
+            p = float2(-d.z, -d.y) / ad.x;
+        }
+        else
+        {
+            face = 1u;
+            p = float2(d.z, -d.y) / ad.x;
+        }
+    }
+    else if (ad.y >= ad.z)
+    {
+        if (d.y >= 0.0)
+        {
+            face = 2u;
+            p = float2(d.x, d.z) / ad.y;
+        }
+        else
+        {
+            face = 3u;
+            p = float2(d.x, -d.z) / ad.y;
+        }
+    }
+    else if (d.z >= 0.0)
+    {
+        face = 4u;
+        p = float2(d.x, -d.y) / ad.z;
+    }
+    else
+    {
+        face = 5u;
+        p = float2(-d.x, -d.y) / ad.z;
+    }
+    return float3(p * 0.5 + 0.5, float(face));
+}
+
 // Sample a direction within a cone around an axis
 // Used for directional light (sun disk) sampling
 // PDF = 1 / (2 * PI * (1 - cos_half_angle))

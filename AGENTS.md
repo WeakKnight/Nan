@@ -44,7 +44,7 @@
 - `Scene.md` – Supplemental deep dive into scene packing (reference when editing descriptors).
 - `mesh.py`, `material.py`, `transform.py` – Data containers for scene construction.
 - `utils.py` – HDR EXR helpers.
-- `vertex_baker/slang_viewer.py` – Native SlangPy/HWRT baker viewer with orbit camera, GBuffer inspection, GPU picking, and visibility-cone diagnostics.
+- `vertex_baker/slang_viewer.py` – Native SlangPy baker viewer with HWRT or raster GBuffer, orbit camera, GPU picking, and visibility-cone diagnostics.
 
 ### Rendering Pass Wrappers
 - `path_tracer.py` – Thin wrapper around path tracing compute shader; binds the `Scene`.
@@ -65,7 +65,7 @@
 | `accumulator.slang` | Temporal accumulation kernel. | Renderer. |
 | `tone_mapper.slang` | ACES-like filmic operator. | Final pass. |
 | `atmosphere.slang` | LUT generation utilities (sky/atmosphere research experiments). | Used by LUT scripts. |
-| `vertex_baker/slang_viewer.slang` | Inline-ray-query material/cone GBuffer, PMR diffuse/specular occlusion, PBR debug composite, picking, and selected-cone overlay. | Native vertex baker viewer. |
+| `vertex_baker/slang_viewer.slang` | Inline-ray-query or raster material/cone GBuffer, PMR diffuse/specular occlusion, PBR debug composite, picking, and selected-cone overlay. | Native vertex baker viewer. |
 | `vertex_baker/ibl_precompute.slang` | Runtime HDR cubemap conversion, SH9 projection, GGX prefilter, DFG integration, and PMR cone-BRDF specular-occlusion LUT generation. | Native vertex baker viewer. |
 
 Include new shaders via `device.load_program(..., ["entry_point"])`; ensure host struct packing matches shader expectations.

@@ -4,7 +4,6 @@ import argparse
 import math
 from pathlib import Path
 
-from interactive_viewer import export_vertex_color_viewer, export_visibility_cone_viewer
 from model import load_gltf_model
 from software_renderer import render_unlit_preview
 from surface_sampler import sample_model_surface
@@ -50,12 +49,6 @@ def parse_args() -> argparse.Namespace:
         choices=("samples", "texture", "vertex-color", "interactive", "visibility"),
         default="samples",
         help="Preview mode: sample overlay, texture unlit, baked vertex color PNG, native SlangPy viewer, or visibility reference bake.",
-    )
-    parser.add_argument(
-        "--viewer-backend",
-        choices=("native", "html"),
-        default="native",
-        help="Interactive viewer backend. Native uses SlangPy HWRT; html preserves the legacy WebGL export.",
     )
     parser.add_argument(
         "--viewer-data",
@@ -332,47 +325,11 @@ def main() -> None:
         npz_output = args.output.with_suffix(".visibility.npz")
         save_visibility_npz(visibility_result, npz_output)
 
-        if args.output.suffix.lower() in (".html", ".htm"):
-            if visibility_cones is not None:
-                export_visibility_cone_viewer(
-                    model,
-                    vertex_colors,
-                    visibility_cones,
-                    args.output,
-                    cone_length=cone_display_length,
-                    rim_segments=max(3, int(args.visibility_cone_rim_segments)),
-                )
-            else:
-                export_vertex_color_viewer(model, vertex_colors, args.output)
-            print(f"Loaded {len(model.meshes)} meshes from {args.asset}")
-            print(f"Wrote interactive visibility viewer to {args.output}")
-            print(f"Wrote visibility reference data to {npz_output}")
-            return
-
     if mode == "interactive":
-        if args.viewer_backend == "html":
-            output = args.output
-            if output.suffix.lower() not in (".html", ".htm"):
-                output = output.with_suffix(".html")
-            if visibility_cones is not None:
-                export_visibility_cone_viewer(
-                    model,
-                    vertex_colors,
-                    visibility_cones,
-                    output,
-                    cone_length=cone_display_length,
-                    rim_segments=max(3, int(args.visibility_cone_rim_segments)),
-                )
-            else:
-                export_vertex_color_viewer(model, vertex_colors, output)
-            print(f"Loaded {len(model.meshes)} meshes from {args.asset}")
-            print(f"Wrote legacy interactive viewer to {output}")
-            return
-
         from slang_viewer import run_slang_viewer
 
         print(f"Loaded {len(model.meshes)} meshes from {args.asset}")
-        print("Starting native SlangPy HWRT viewer")
+        print("Starting native SlangPy viewer")
         run_slang_viewer(
             model,
             vertex_colors,
