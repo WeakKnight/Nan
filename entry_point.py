@@ -122,6 +122,48 @@ def parse_args() -> argparse.Namespace:
         help="Enable scripted camera controller motion test.",
     )
     parser.add_argument(
+        "--renderer",
+        choices=("path-tracing", "texture-space"),
+        default="path-tracing",
+        help="Interactive/headless renderer mode.",
+    )
+    parser.add_argument(
+        "--texture-space-texels-per-unit",
+        type=float,
+        default=16.0,
+        help="World-space Mesh Colors density used by the texture-space renderer.",
+    )
+    parser.add_argument(
+        "--texture-space-min-resolution",
+        type=int,
+        default=4,
+        help="Minimum power-of-two barycentric grid resolution per triangle.",
+    )
+    parser.add_argument(
+        "--texture-space-max-resolution",
+        type=int,
+        default=64,
+        help="Maximum power-of-two barycentric grid resolution per triangle.",
+    )
+    parser.add_argument(
+        "--texture-space-max-texels",
+        type=int,
+        default=16_777_216,
+        help="Hard cap for 16-byte texture-space irradiance payload slots.",
+    )
+    parser.add_argument(
+        "--texture-space-samples-per-texel",
+        type=int,
+        default=1,
+        help="Hemisphere samples traced per texel and frame.",
+    )
+    parser.add_argument(
+        "--texture-space-max-bounces",
+        type=int,
+        default=3,
+        help="Maximum indirect path bounces in texture space.",
+    )
+    parser.add_argument(
         "--enable-extension",
         action="append",
         default=[],
@@ -3264,10 +3306,21 @@ def main() -> None:
 
     from app import App, AppConfig
     from path_tracing_renderer import PathTracingRenderer
+    from texture_space_path_tracing_renderer import TextureSpacePathTracingRenderer
 
     static_shadow_mode = _parse_static_shadow_mode(args.static_shadow_mode)
     enabled_extensions = _enabled_extensions_from_args(args, static_shadow_mode)
-    renderer = PathTracingRenderer()
+    if args.renderer == "texture-space":
+        renderer = TextureSpacePathTracingRenderer(
+            texels_per_unit=max(1e-6, float(args.texture_space_texels_per_unit)),
+            min_resolution=max(1, int(args.texture_space_min_resolution)),
+            max_resolution=max(1, int(args.texture_space_max_resolution)),
+            max_texels=max(1, int(args.texture_space_max_texels)),
+            samples_per_texel=max(1, int(args.texture_space_samples_per_texel)),
+            max_bounces=max(1, int(args.texture_space_max_bounces)),
+        )
+    else:
+        renderer = PathTracingRenderer()
 
     base_config = AppConfig()
     output_path = Path(args.output) if args.output else base_config.headless_output

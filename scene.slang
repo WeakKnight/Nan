@@ -269,7 +269,7 @@ struct Scene {
         // Double-sided handling (similar to UE's TwoSidedSign approach)
         // IsFrontFace records the original geometric orientation
         // Normals are flipped to always point toward the viewer
-        bool double_sided = true; // material.is_double_sided();
+        bool double_sided = material.is_double_sided();
         bool is_front_face = dot(face_normal, view_direction) > 0;
         
         // Compute TwoSidedSign: +1 for front face, -1 for back face (when double-sided)
@@ -831,6 +831,20 @@ struct Scene {
             return sample_sst_sun_visibility(shadow_position);
 
         return sample_depth_texture_sun_visibility(shadow_position);
+    }
+
+    float3 sample_directional_irradiance(ShadingData sd, float2 rand_sample)
+    {
+        float4 sample_result = sample_cone_direction(
+            directional_light.direction,
+            directional_light.cos_half_angle,
+            rand_sample);
+        float3 light_direction = sample_result.xyz;
+        float visibility = sample_static_sun_visibility(sd, light_direction);
+        float n_dot_l = max(0.0, dot(sd.shading_frame.n, light_direction));
+        float3 illuminance =
+            directional_light.get_outer_space_illuminance() * get_sun_transmittance_at_view();
+        return visibility * illuminance * n_dot_l;
     }
 
     float4 sample_directional_light_with_visibility(

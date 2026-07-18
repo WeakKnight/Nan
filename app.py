@@ -345,6 +345,10 @@ class App:
         self._reset_headless_temporal_state()
         if self.renderer is not None and hasattr(self.renderer, "reset_accumulator"):
             self.renderer.reset_accumulator = True
+        if self.renderer is not None and hasattr(self.renderer, "reset_texture_space"):
+            self.renderer.reset_texture_space = True
+            if hasattr(self.renderer, "texture_iteration"):
+                self.renderer.texture_iteration = 0
         self._headless_loop()
 
     def _reset_headless_temporal_state(self) -> None:

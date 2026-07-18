@@ -6,6 +6,7 @@ from typing import Optional
 ALPHA_MODE_OPAQUE = 0  # fully opaque
 ALPHA_MODE_MASK = 1    # discard if alpha < cutoff
 ALPHA_MODE_BLEND = 2   # stochastic alpha
+MATERIAL_FLAG_DOUBLE_SIDED = 1 << 0
 
 
 class Material:
@@ -20,6 +21,7 @@ class Material:
     - normal_texture: normal map
     - alpha_mode: Alpha mode (OPAQUE/MASK/BLEND)
     - alpha_cutoff: Alpha cutoff threshold (default 0.5)
+    - double_sided: enable back-face shading and texture-space back cache
     """
     
     def __init__(self, 
@@ -37,7 +39,8 @@ class Material:
                  specular_color_texture: Optional[str] = None,
                  # Alpha related properties
                  alpha_mode: int = ALPHA_MODE_OPAQUE,
-                 alpha_cutoff: float = 0.5):
+                 alpha_cutoff: float = 0.5,
+                 double_sided: bool = False):
         super().__init__()
         # Constant values
         self.base_color = base_color
@@ -57,9 +60,11 @@ class Material:
         # Alpha related
         self.alpha_mode = alpha_mode
         self.alpha_cutoff = alpha_cutoff
-        
-        # TODO: implement later
-        self.flags = 65535
+        self.double_sided = bool(double_sided)
+
+        self.flags = (
+            MATERIAL_FLAG_DOUBLE_SIDED if self.double_sided else 0
+        )
         self.shading_model = 65535
     
     def has_any_texture(self) -> bool:

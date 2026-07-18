@@ -110,6 +110,7 @@ class Scene:
     def __init__(self, device: spy.Device, scene_node: SceneNode, event_distpacher: SyncEventDispatcher):
         super().__init__()
         self.device: Device = device
+        self.scene_node: SceneNode = scene_node
         self.event_distpacher: SyncEventDispatcher = event_distpacher
 
         self.linear_sampler: Sampler = device.create_sampler()
@@ -630,7 +631,9 @@ class Scene:
         return spy.float4x4(world_to_shadow), spy.float4x4(shadow_to_world)
 
     def _reset_accumulation(self):
-        self.event_distpacher.dispatch("camera_move", None)
+        self.event_distpacher.dispatch(
+            "camera_move", {"texture_space": True}
+        )
 
     def _set_static_shadow_status(self, text: str):
         if self._static_shadow_status_text is not None:
@@ -1221,7 +1224,9 @@ class Scene:
         
         # Update directional light intensity from slider if present
         if self._intensity_slider is not None:
-            self._directional_light_intensity = self._intensity_slider.value
+            intensity = float(self._intensity_slider.value)
+            if abs(intensity - self._directional_light_intensity) > 1e-6:
+                self.directional_light_intensity = intensity
 
         if self._sun_direction_dirty:
             self._generate_sky_view_lut()
@@ -1304,7 +1309,10 @@ class Scene:
     @directional_light_intensity.setter
     def directional_light_intensity(self, value: float):
         """Set directional light intensity."""
-        self._directional_light_intensity = max(0.0, value)
+        value = max(0.0, value)
+        if abs(value - self._directional_light_intensity) > 1e-6:
+            self._directional_light_intensity = value
+            self._reset_accumulation()
 
     @property
     def sun_direction(self) -> spy.float3:
@@ -1325,7 +1333,7 @@ class Scene:
                 self.static_shadow_mode = Scene.SHADOW_MODE_REALTIME
                 self._sync_shadow_mode_ui()
                 self._set_static_shadow_status('Static shadow: sun changed, rebake needed')
-                self._reset_accumulation()
+            self._reset_accumulation()
 
     def bind(self, cursor: spy.ShaderCursor):
         cursor["tlas"] = self.tlas

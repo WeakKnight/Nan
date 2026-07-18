@@ -139,6 +139,7 @@ class SceneNode:
         # Alpha related
         alpha_mode = ALPHA_MODE_OPAQUE
         alpha_cutoff = 0.5
+        double_sided = False
         
         def resolve_texture_path(texture_source) -> str | None:
             """Resolve texture path from trimesh texture source."""
@@ -240,6 +241,9 @@ class SceneNode:
             
             if hasattr(material, 'alphaCutoff') and material.alphaCutoff is not None:
                 alpha_cutoff = float(material.alphaCutoff)
+
+            if hasattr(material, 'doubleSided') and material.doubleSided is not None:
+                double_sided = bool(material.doubleSided)
             
             # If trimesh didn't provide textures, try to get from gltf_textures by material name
             if gltf_textures and hasattr(material, 'name') and material.name:
@@ -272,6 +276,8 @@ class SceneNode:
                             alpha_mode = ALPHA_MODE_BLEND
                     if tex_info.get('alphaCutoff') is not None:
                         alpha_cutoff = float(tex_info['alphaCutoff'])
+                    if tex_info.get('doubleSided') is not None:
+                        double_sided = bool(tex_info['doubleSided'])
         
         # Try vertex colors as fallback for base color
         if base_color_texture is None:
@@ -308,7 +314,8 @@ class SceneNode:
             emissive_texture=emissive_texture,
             specular_color_texture=specular_color_texture,
             alpha_mode=alpha_mode,
-            alpha_cutoff=alpha_cutoff
+            alpha_cutoff=alpha_cutoff,
+            double_sided=double_sided,
         )
 
     @staticmethod
@@ -455,6 +462,8 @@ class SceneNode:
                 tex_info['alphaMode'] = mat.alphaMode
             if mat.alphaCutoff is not None:
                 tex_info['alphaCutoff'] = mat.alphaCutoff
+            if mat.doubleSided is not None:
+                tex_info['doubleSided'] = mat.doubleSided
             
             material_textures[idx] = tex_info
             material_textures[mat.name] = tex_info  # Also store by name
@@ -633,9 +642,27 @@ class SceneNode:
         scene_node.camera.fov = 60.0  # slightly narrower FOV
 
         # Materials
-        white_mat = scene_node.add_material(Material(base_color=spy.float3(0.73, 0.73, 0.73)))
-        red_mat = scene_node.add_material(Material(base_color=spy.float3(0.65, 0.05, 0.05)))
-        green_mat = scene_node.add_material(Material(base_color=spy.float3(0.12, 0.45, 0.15)))
+        white_wall_mat = scene_node.add_material(
+            Material(
+                base_color=spy.float3(0.73, 0.73, 0.73),
+                double_sided=True,
+            )
+        )
+        red_wall_mat = scene_node.add_material(
+            Material(
+                base_color=spy.float3(0.65, 0.05, 0.05),
+                double_sided=True,
+            )
+        )
+        green_wall_mat = scene_node.add_material(
+            Material(
+                base_color=spy.float3(0.12, 0.45, 0.15),
+                double_sided=True,
+            )
+        )
+        white_box_mat = scene_node.add_material(
+            Material(base_color=spy.float3(0.73, 0.73, 0.73))
+        )
         light_mat = scene_node.add_material(Material(base_color=spy.float3(1.0, 1.0, 1.0), emissive=spy.float3(15.0, 15.0, 15.0)))
 
         # Shared quad mesh for floor/ceiling (XZ plane, normal +Y) - spans x:[-1,1], z:[-1,1]
@@ -655,7 +682,7 @@ class SceneNode:
         floor_transform.translation = spy.float3(0, 0, 0)
         floor_transform.update_matrix()
         floor_tid = scene_node.add_transform(floor_transform)
-        scene_node.add_instance(quad_mesh, white_mat, floor_tid)
+        scene_node.add_instance(quad_mesh, white_wall_mat, floor_tid)
 
         # Ceiling (white) - at y=2, flipped to face down
         ceiling_transform = Transform()
@@ -663,28 +690,28 @@ class SceneNode:
         ceiling_transform.rotation = spy.float3(math.pi, 0, 0)
         ceiling_transform.update_matrix()
         ceiling_tid = scene_node.add_transform(ceiling_transform)
-        scene_node.add_instance(quad_mesh, white_mat, ceiling_tid)
+        scene_node.add_instance(quad_mesh, white_wall_mat, ceiling_tid)
 
         # Back wall (white) - at z=-1, center at (0,1,-1)
         back_transform = Transform()
         back_transform.translation = spy.float3(0, 1, -1)
         back_transform.update_matrix()
         back_tid = scene_node.add_transform(back_transform)
-        scene_node.add_instance(back_wall_mesh, white_mat, back_tid)
+        scene_node.add_instance(back_wall_mesh, white_wall_mat, back_tid)
 
         # Left wall (red) - at x=-1, center at (-1,1,0), facing +X
         left_transform = Transform()
         left_transform.translation = spy.float3(-1, 1, 0)
         left_transform.update_matrix()
         left_tid = scene_node.add_transform(left_transform)
-        scene_node.add_instance(left_wall_mesh, red_mat, left_tid)
+        scene_node.add_instance(left_wall_mesh, red_wall_mat, left_tid)
 
         # Right wall (green) - at x=1, center at (1,1,0), facing -X
         right_transform = Transform()
         right_transform.translation = spy.float3(1, 1, 0)
         right_transform.update_matrix()
         right_tid = scene_node.add_transform(right_transform)
-        scene_node.add_instance(right_wall_mesh, green_mat, right_tid)
+        scene_node.add_instance(right_wall_mesh, green_wall_mat, right_tid)
 
         # Light on ceiling (small quad)
         light_mesh = scene_node.add_mesh(Mesh.create_quad([0.4, 0.4]))
@@ -702,7 +729,7 @@ class SceneNode:
         tall_box_transform.rotation = spy.float3(0, 18, 0)
         tall_box_transform.update_matrix()
         tall_box_tid = scene_node.add_transform(tall_box_transform)
-        scene_node.add_instance(tall_box_mesh, white_mat, tall_box_tid)
+        scene_node.add_instance(tall_box_mesh, white_box_mat, tall_box_tid)
 
         # Short box (right side) - rotated slightly the other way
         short_box_mesh = scene_node.add_mesh(Mesh.create_cube(spy.float3(0.5, 0.6, 0.5)))
@@ -711,7 +738,7 @@ class SceneNode:
         short_box_transform.rotation = spy.float3(0, -18, 0)
         short_box_transform.update_matrix()
         short_box_tid = scene_node.add_transform(short_box_transform)
-        scene_node.add_instance(short_box_mesh, white_mat, short_box_tid)
+        scene_node.add_instance(short_box_mesh, white_box_mat, short_box_tid)
 
         return scene_node
 

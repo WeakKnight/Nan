@@ -9,6 +9,7 @@ An **educational** real-time GPU path tracing renderer built with SlangPy.
 - **Simple unidirectional path tracing** - Easy to understand and extend
 - **Lambert BSDF only** - No complex material models, perfect for learning
 - **Headless mode** - Render without a window, ideal for AI-assisted debugging
+- **Texture-space path tracing** - Progressively caches irradiance on per-triangle barycentric Mesh Colors and resolves it from any camera view
 - **Static shadow mask experiments** - Compact SST shadow queries can be sampled through a screen-space adaptive mask.
 
 ## Example: Adaptive Static Shadow Mask
@@ -42,6 +43,13 @@ python entry_point.py
 | `--height <H>` | Render height | 1080 |
 | `--vsync` | Enable V-Sync | - |
 | `--no-srgb` | Keep linear color space in output | - |
+| `--renderer path-tracing\|texture-space` | Select the standard or Mesh Colors renderer | path-tracing |
+| `--texture-space-texels-per-unit <N>` | World-space Mesh Colors density | 16 |
+| `--texture-space-min-resolution <N>` | Minimum per-triangle grid resolution | 4 |
+| `--texture-space-max-resolution <N>` | Maximum per-triangle grid resolution | 64 |
+| `--texture-space-max-texels <N>` | Hard irradiance-cache payload-slot budget | 16777216 |
+| `--texture-space-samples-per-texel <N>` | Hemisphere samples per texel per frame | 1 |
+| `--texture-space-max-bounces <N>` | Indirect texture-space path depth | 3 |
 
 ## Headless Mode
 
@@ -57,6 +65,33 @@ python entry_point.py --headless --width 3840 --height 2160 --frames 256
 # Preserve linear HDR data
 python entry_point.py --headless --no-srgb --output linear.png
 ```
+
+## Texture-Space Mode
+
+The texture-space renderer uses the Mesh Colors parameterization from the
+TransportFormer renderer: every triangle owns a barycentric lattice, so it does
+not require a UV atlas, chart packing, or dilation. Irradiance accumulates in
+that view-independent cache while a primary-ray resolve pass maps it back to
+the current camera. Moving the camera resets only screen accumulation; changing
+scene lighting or pressing **Reset Texture Irradiance** resets the texel cache.
+
+```bash
+# Interactive texture-space preview
+python entry_point.py --renderer texture-space
+
+# Low-cost headless smoke
+python entry_point.py --renderer texture-space --headless --frames 16 \
+  --width 512 --height 512 --texture-space-texels-per-unit 8 \
+  --output texture-space.png
+```
+
+Large scenes should use a conservative density and resolution cap. Layout
+creation fails with a clear error instead of allocating beyond
+`--texture-space-max-texels`. Every surface texel owns one 16-byte front
+irradiance slot. Only materials explicitly marked `double_sided` allocate and
+trace an additional 16-byte back slot, so single-sided geometry has no
+double-sided cache overhead. glTF `doubleSided` is preserved during material
+import; other material sources default to single-sided.
 
 ## Adding a New Render Pass
 

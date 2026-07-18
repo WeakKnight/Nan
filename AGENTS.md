@@ -8,7 +8,7 @@
 ---
 
 ## Runtime Flow
-1. `entry_point.py` creates a `PathTracingRenderer`.
+1. `entry_point.py` creates a `PathTracingRenderer` or `TextureSpacePathTracingRenderer` from `--renderer`.
 2. `App` (window, device, swapchain, UI) loads an asset scene through `SceneNode` → `Scene`.
 3. Camera/controller feeds jittered view data; event dispatcher announces camera/key changes.
 4. Renderer orchestrates compute passes (path tracing, accumulation, tonemap) on `spy.CommandEncoder`.
@@ -27,6 +27,7 @@
 | Renderer | Pass Chain | Highlights |
 |----------|------------|------------|
 | `PathTracingRenderer` | `PathTracer` → `Accumulator` → `ToneMapper` | Standard path tracing with cosine BSDF, up to 5 bounces. |
+| `TextureSpacePathTracingRenderer` | `TextureSpacePathTracer` → `MeshColorsResolve` → `Accumulator` → `ToneMapper` | View-independent irradiance accumulation on per-triangle barycentric grids; back slots are allocated only for double-sided materials. |
 
 ---
 
@@ -43,11 +44,14 @@
 - `scene.py` – GPU-ready scene (descriptors, buffers, BLAS/TLAS builds, env map).
 - `Scene.md` – Supplemental deep dive into scene packing (reference when editing descriptors).
 - `mesh.py`, `material.py`, `transform.py` – Data containers for scene construction.
+- `mesh_colors.py` – CPU Mesh Colors layout, per-face/instance offsets, compact material-driven side slots, resolution clamps, and payload-slot budget enforcement.
 - `utils.py` – HDR EXR helpers.
 - `vertex_baker/slang_viewer.py` – Native SlangPy baker viewer with HWRT or raster GBuffer, orbit camera, GPU picking, and visibility-cone diagnostics.
 
 ### Rendering Pass Wrappers
 - `path_tracer.py` – Thin wrapper around path tracing compute shader; binds the `Scene`.
+- `texture_space_path_tracer.py` – Dispatches progressive irradiance tracing over Mesh Colors texels.
+- `mesh_colors_resolve.py` – Resolves the view-independent Mesh Colors cache through current-camera primary hits.
 - `accumulator.py` – Float accumulation with reset flag; history texture fetched via `RenderData`.
 - `tone_mapper.py` – ACES filmic tonemap pass; toggled via UI checkbox in renderers.
 - `ping_pong_texture.py` – Double-buffer helper backed by `RenderData` texture cache.
@@ -62,6 +66,9 @@
 | `scene.slang` | GPU-side scene accessors (vertex fetch, env sampling, ray queries). | `path_tracer`. |
 | `camera.slang` | Camera matrices, jitter, ray generation. | All rendering passes. |
 | `path_tracer.slang` | GI path tracer, cosine BSDF, up to 5 bounces. | `PathTracer`. |
+| `mesh_colors.slang` | Barycentric lattice addressing, metadata lookup, and irradiance interpolation. | Texture-space passes. |
+| `texture_space_path_tracer.slang` | Progressive per-texel irradiance path tracing with Nan sky/sun/static-shadow lighting. | `TextureSpacePathTracer`. |
+| `mesh_colors_resolve.slang` | Primary-ray lookup of cached irradiance for the current camera. | `MeshColorsResolve`. |
 | `accumulator.slang` | Temporal accumulation kernel. | Renderer. |
 | `tone_mapper.slang` | ACES-like filmic operator. | Final pass. |
 | `atmosphere.slang` | LUT generation utilities (sky/atmosphere research experiments). | Used by LUT scripts. |
@@ -74,7 +81,7 @@ Include new shaders via `device.load_program(..., ["entry_point"])`; ensure host
 
 ## Scene & Asset Workflow
 - Axis conversion defaults to `"none"` but `"z_up_to_y_up"` handles common DCC exports.
-- Asset loader supports OBJ/STL/PLY/glTF/OFF/3MF/Collada. Materials default to extracted diffuse → vertex color → provided override → neutral gray.
+- Asset loader supports OBJ/STL/PLY/glTF/OFF/3MF/Collada. Materials default to extracted diffuse → vertex color → provided override → neutral gray; glTF `doubleSided` is preserved while other sources default to single-sided.
 - Camera metadata from JSON seeds `CameraController`. If not provided, `SceneNode` creates a default camera aimed at the scene bounds.
 - Instancing: `SceneNode.add_scene_node` reuses meshes/materials; `Scene` flags odd-negative transforms to maintain correct winding.
 
@@ -83,7 +90,7 @@ Include new shaders via `device.load_program(..., ["entry_point"])`; ensure host
 ## UI, Input & Events
 - Camera: WASD + mouse look; `CameraController.update` publishes `"camera_move"` when position/orientation changes.
 - Hotkeys: `Esc` quit, `F1` TEV viewer, `F2` screenshot, `F11` RenderDoc capture toggle.
-- Renderers define UI controls in `setup_ui`; current toggles: "Use Accum".
+- Renderers define UI controls in `setup_ui`; texture-space mode adds screen accumulation, pause/reset, exposure, and cache status.
 - Event dispatcher routes keyboard presses to renderers; add new listeners via `scene.event_distpacher.subscribe`.
 
 ---
@@ -110,6 +117,8 @@ Reference materials in `docs/`:
 
 ## Testing & Verification
 - Tests assume a GPU-capable Python runtime; they instantiate Slang devices—avoid running on headless CI without RT hardware.
+- `test_mesh_colors.py` validates the CPU-only barycentric layout and budget guard.
+- Texture-space GPU smoke: `python entry_point.py --renderer texture-space --headless --frames 16 --width 512 --height 512`.
 
 ---
 
