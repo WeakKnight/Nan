@@ -7,6 +7,12 @@ from dataclasses import dataclass
 import numpy as np
 import slangpy as spy
 
+from mesh_colors_adjacency import (
+    MeshColorsAdjacencyDiagnostics,
+    MeshColorsFaceAdjacency,
+    MeshColorsMeshAdjacency,
+    build_triangle_adjacency,
+)
 from scene_node import SceneNode
 
 
@@ -115,6 +121,8 @@ class MeshColorsSideInfo:
 @dataclass(frozen=True)
 class MeshColorsLayout:
     face_infos: tuple[MeshColorsFaceInfo, ...]
+    adjacency_infos: tuple[MeshColorsFaceAdjacency, ...]
+    adjacency_diagnostics: MeshColorsAdjacencyDiagnostics
     instance_infos: tuple[MeshColorsInstanceInfo, ...]
     side_infos: tuple[MeshColorsSideInfo, ...]
     total_surface_texels: int
@@ -157,13 +165,45 @@ class MeshColorsLayout:
         max_total_texels = max(1, int(max_total_texels))
 
         face_infos: list[MeshColorsFaceInfo] = []
+        adjacency_infos: list[MeshColorsFaceAdjacency] = []
         instance_infos: list[MeshColorsInstanceInfo] = []
         side_infos: list[MeshColorsSideInfo] = []
         total_surface_texels = 0
         total_payload_count = 0
+        mesh_adjacencies: dict[int, MeshColorsMeshAdjacency] = {}
+
+        for mesh_id, _, _ in scene_node.instances:
+            if mesh_id not in mesh_adjacencies:
+                mesh_adjacencies[mesh_id] = build_triangle_adjacency(
+                    scene_node.meshes[mesh_id].indices
+                )
+
+        adjacency_diagnostics = MeshColorsAdjacencyDiagnostics(
+            boundary_edge_count=sum(
+                adjacency.diagnostics.boundary_edge_count
+                for adjacency in mesh_adjacencies.values()
+            ),
+            manifold_edge_count=sum(
+                adjacency.diagnostics.manifold_edge_count
+                for adjacency in mesh_adjacencies.values()
+            ),
+            non_manifold_edge_count=sum(
+                adjacency.diagnostics.non_manifold_edge_count
+                for adjacency in mesh_adjacencies.values()
+            ),
+            degenerate_face_count=sum(
+                adjacency.diagnostics.degenerate_face_count
+                for adjacency in mesh_adjacencies.values()
+            ),
+            orientation_anomaly_count=sum(
+                adjacency.diagnostics.orientation_anomaly_count
+                for adjacency in mesh_adjacencies.values()
+            ),
+        )
 
         for mesh_id, material_id, transform_id in scene_node.instances:
             mesh = scene_node.meshes[mesh_id]
+            mesh_adjacency = mesh_adjacencies[mesh_id]
             material = scene_node.materials[material_id]
             is_double_sided = bool(getattr(material, "double_sided", False))
             payload_multiplier = 2 if is_double_sided else 1
@@ -213,6 +253,7 @@ class MeshColorsLayout:
                 face_infos.append(MeshColorsFaceInfo(local_address, resolution))
                 local_address += patch_texels
 
+            adjacency_infos.extend(mesh_adjacency.faces)
             instance_infos.append(
                 MeshColorsInstanceInfo(
                     face_offset=face_offset,
@@ -244,6 +285,8 @@ class MeshColorsLayout:
 
         return cls(
             face_infos=tuple(face_infos),
+            adjacency_infos=tuple(adjacency_infos),
+            adjacency_diagnostics=adjacency_diagnostics,
             instance_infos=tuple(instance_infos),
             side_infos=tuple(side_infos),
             total_surface_texels=total_surface_texels,
@@ -251,6 +294,17 @@ class MeshColorsLayout:
             texels_per_unit=texels_per_unit,
             min_resolution=min_resolution,
             max_resolution=max_resolution,
+        )
+
+    def create_adjacency_gpu_buffer(self, device: spy.Device) -> spy.Buffer:
+        adjacency_data = np.frombuffer(
+            b"".join(info.pack() for info in self.adjacency_infos),
+            dtype=np.uint8,
+        ).copy()
+        return device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="mesh_colors_adjacency_infos",
+            data=adjacency_data,
         )
 
     def create_gpu_buffers(

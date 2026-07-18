@@ -28,6 +28,7 @@ class TextureSpacePathTracer:
             self.instance_infos_buffer,
             self.side_infos_buffer,
         ) = layout.create_gpu_buffers(device)
+        self.adjacency_infos_buffer = layout.create_adjacency_gpu_buffer(device)
 
     def execute(
         self,
