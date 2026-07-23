@@ -28,6 +28,7 @@
 |----------|------------|------------|
 | `PathTracingRenderer` | `PathTracer` → `Accumulator` → `ToneMapper` | Standard path tracing with cosine BSDF, up to 5 bounces. |
 | `TextureSpacePathTracingRenderer` | `TextureSpacePathTracer` → `MeshColorsResolve` → `Accumulator` → `ToneMapper`; Save: `MeshColorsSurfaceFilter` → RGB9E5 | View-independent irradiance accumulation on per-triangle barycentric grids; back slots are allocated only for double-sided materials. |
+| `SurfaceProbePathTracingRenderer` | Adaptive WSE → budgeted deficit repair → protected zero-count closure; `SurfaceProbePathTracer` → `SurfaceProbeResolve` → optional `Accumulator` → `ToneMapper` | Sparse surface irradiance cache with point-octree reconstruction. Protected closure probes bypass WSE and share the normal reconstruction estimator; legacy vertex fallback is opt-in. |
 
 ---
 
@@ -47,6 +48,9 @@
 - `mesh_colors.py` – CPU Mesh Colors layout, per-face/instance offsets, Ptex-style triangle adjacency expansion, compact material-driven side slots, resolution clamps, and payload-slot budget enforcement.
 - `mesh_colors_adjacency.py` – Shared-index triangle topology builder, edge-coordinate convention, diagnostics, and compact CPU/GPU adjacency packing. Split-index seams are boundaries; degenerate and non-manifold edges remain unlinked.
 - `mesh_colors_rgb9e5.py` – GPU wrapper that packs filtered float irradiance into one RGB9E5 `uint` per payload.
+- `surface_probes.py` – Compatible-support pre-analysis, `area*m` allocation, adaptive WSE, budgeted repair, protected zero-count closure, optional vertex anchors, double-sided expansion, and compact per-instance point-octree packing.
+- `surface_probe_sampler.py` – Lazy CMake build, `ctypes` bindings, validation, and Python references for native weighted sample elimination, deficit repair, and compatible-kernel support estimation.
+- `surface_probe_sampler.cpp`, `surface_probe_sampler.h` – C ABI around the vendored cyCodeBase WSE plus variable-radius adaptive WSE, deterministic global greedy repair, and parallel `f(x)`/`m(x)` estimation. Adaptive initialization is parallel; elimination uses an indexed mutable max-heap and neighbor-owned radii for correct asymmetric updates.
 - `utils.py` – HDR EXR helpers.
 - `vertex_baker/slang_viewer.py` – Native SlangPy baker viewer with HWRT or raster GBuffer, orbit camera, GPU picking, and visibility-cone diagnostics.
 
@@ -55,6 +59,9 @@
 - `texture_space_path_tracer.py` – Dispatches progressive irradiance tracing over Mesh Colors texels.
 - `mesh_colors_surface_filter.py` – Runs freeze-time one-ring Gaussian diffusion through one payload-sized ping-pong scratch buffer. Flat world normals are precomputed with transformed winding, including mirrored transforms.
 - `mesh_colors_resolve.py` – Resolves the view-independent Mesh Colors cache through current-camera primary hits.
+- `surface_probe_path_tracer.py` – Progressively traces diffuse irradiance into the sparse surface-probe cache.
+- `surface_probe_resolve.py` – Reconstructs primary hits from the strongest compatible point-octree samples and exposes gathered-count, `f(x)`, `m(x)`, probe self-hit, and legacy fallback diagnostics.
+- `surface_probe_path_tracing_renderer.py` – Orchestrates probe tracing, resolve, optional screen accumulation, and tone mapping.
 - `accumulator.py` – Float accumulation with reset flag; history texture fetched via `RenderData`.
 - `tone_mapper.py` – ACES filmic tonemap pass; toggled via UI checkbox in renderers.
 - `ping_pong_texture.py` – Double-buffer helper backed by `RenderData` texture cache.
@@ -75,6 +82,9 @@
 | `mesh_colors_resolve.slang` | Primary-ray lookup of cached irradiance for the current camera. | `MeshColorsResolve`. |
 | `mesh_colors_rgb9e5_pack.slang` | Packs writable float3 irradiance into a 32-bit shared-exponent RGB9E5 payload. | `MeshColorsRGB9E5Packer`. |
 | `mesh_colors_frozen_resolve.slang` | Primary-ray lookup from a read-only RGB9E5 irradiance buffer. | `MeshColorsResolve`. |
+| `surface_probes.slang` | Point-octree gather, compact surface kernel, and irradiance reconstruction. | Surface-probe passes. |
+| `surface_probe_path_tracer.slang` | Progressive irradiance tracing for base, repair, protected, and optional vertex-anchor records. | `SurfaceProbePathTracer`. |
+| `surface_probe_resolve.slang` | Primary-hit visible gather, 2R emergency tier, diagnostics, and optional legacy vertex fallback. | `SurfaceProbeResolve`. |
 | `accumulator.slang` | Temporal accumulation kernel. | Renderer. |
 | `tone_mapper.slang` | ACES-like filmic operator. | Final pass. |
 | `atmosphere.slang` | LUT generation utilities (sky/atmosphere research experiments). | Used by LUT scripts. |
@@ -97,6 +107,7 @@ Include new shaders via `device.load_program(..., ["entry_point"])`; ensure host
 - Camera: WASD + mouse look; `CameraController.update` publishes `"camera_move"` when position/orientation changes.
 - Hotkeys: `Esc` quit, `F1` TEV viewer, `F2` screenshot, `F11` RenderDoc capture toggle.
 - Renderers define UI controls in `setup_ui`; texture-space mode adds screen accumulation, pause/reset, exposure, cache status, and `Filter Before RGB9E5` controls for pass count, texel-hop spatial sigma, and normal-angle sigma.
+- Surface-probe mode adds optional screen accumulation, pause/reset, exposure, status, and `Show Gather Count`; its false-color legend is magenta=0, red/orange=1-3, yellow=4-7, green=8-15, cyan=16-23, and blue/white=24-32.
 - Event dispatcher routes keyboard presses to renderers; add new listeners via `scene.event_distpacher.subscribe`.
 
 ### Mesh Colors Surface-Filter Contract
@@ -112,6 +123,10 @@ Include new shaders via `device.load_program(..., ["entry_point"])`; ensure host
 - Shader debugging: drop colored diagnostics into RW textures; flush prints with `device.flush_print()` (first frame already does this).
 - `test_print.py` + `test_print.slang` demonstrate GPU-side `print` debugging; run the script to verify Slang `print` output and use it as a template for logging thread-local data.
 - GPU crashes: double-check `device` compiler options (`include_paths`, defines) in `app.py`.
+- Native surface-probe sampling defaults to `auto`; use `--surface-probe-sampler-backend cpp` to require the C++ backend or `python` for the reference implementation. The backend controls both WSE and deficit repair; CMake output lives in `surface_probe_sampler_build/`.
+- Surface-probe deficit repair runs after the exact-budget WSE base, targets the primary-radius gather count, may append up to `repair_budget_ratio * base_sites`, and never recomputes the base kernel radius.
+- Adaptive surface-probe WSE is enabled by default. Triangle support produces `m=clamp(1/f,1,M)`; base allocation and proposal sampling use `area*m`, while WSE receives the normalized relative density `m/mean(m)` and local radius `r_base/sqrt(relative_density)`. `--surface-probe-no-adaptive-wse` restores the area-only path.
+- Use `--surface-probe-profile-build` to emit flushed startup samples for asset import, Scene GPU/AS creation, adaptive prepass, candidate/WSE, budgeted repair, protected closure, support recomputation, octree packing, GPU upload, and shader initialization.
 
 ---
 
@@ -132,7 +147,9 @@ Reference materials in `docs/`:
 - `test_mesh_colors_adjacency.py` validates boundaries, strips, fans, winding, seams, closed and non-manifold topology, multi-instance ranges, and Python/Slang packing agreement.
 - `test_mesh_colors_surface_filter.py` validates one-edge remapping, bounded fan propagation, normal gating, seam/non-manifold isolation, front/back separation, constant preservation, and variance reduction.
 - `test_mesh_colors_rgb9e5.py` validates GPU packing, shader decoding, HDR edge cases, and shared-exponent quantization bounds.
+- `test_surface_probes.py` validates native sampler determinism/version/spacing quality, adaptive population parity and normal isolation, C++/Python deficit-repair/support parity, budget caps, CPU/GPU strides, compact octree ranges, queries, and audit improvement.
 - Texture-space GPU smoke: `python entry_point.py --renderer texture-space --headless --frames 16 --width 512 --height 512`.
+- Surface-probe GPU smoke: `python entry_point.py --renderer surface-probe --surface-probe-count 37000 --headless --frames 4096 --width 512 --height 512`.
 
 ---
 

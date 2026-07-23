@@ -350,6 +350,9 @@ struct HitInfo
 struct ShadingData
 {
     float3 position;
+    float3 ray_origin_front;
+    float3 ray_origin_back;
+    float ray_origin_offset;
     float3 view_direction;
     Frame geometry_frame;
     Frame shading_frame;
@@ -361,6 +364,10 @@ struct ShadingData
     bool front_facing;      // Original geometric orientation (for IOR in refraction)
     bool double_sided;
 
+    // The legacy comment below names the original bit-offset method. Hit
+    // shading now supplies conservative front/back spawn points computed
+    // from triangle reconstruction, transform, and traversal error bounds.
+
     /*
      *  Computes new ray origin based on the hit point to avoid self-intersection.
      *  The method is described in Ray Tracing Gems, Chapter 6, "A Fast and Robust
@@ -371,10 +378,9 @@ struct ShadingData
      */
     float3 compute_new_ray_origin(float position_bias_sign = 1.0)
     {
-        // face_normal already points toward viewer, so:
-        // - position_bias_sign = +1: offset along face_normal (reflection, same side as viewer)
-        // - position_bias_sign = -1: offset against face_normal (transmission, opposite side)
-        return compute_ray_origin(position, position_bias_sign * face_normal);
+        return position_bias_sign >= 0.0
+            ? ray_origin_front
+            : ray_origin_back;
     }
 };
 

@@ -10,6 +10,7 @@ An **educational** real-time GPU path tracing renderer built with SlangPy.
 - **Lambert BSDF only** - No complex material models, perfect for learning
 - **Headless mode** - Render without a window, ideal for AI-assisted debugging
 - **Texture-space path tracing** - Progressively caches irradiance on per-triangle barycentric Mesh Colors and resolves it from any camera view
+- **Surface-probe path tracing** - Builds a sparse blue-noise irradiance cache with native weighted sample elimination and point-octree reconstruction
 - **Static shadow mask experiments** - Compact SST shadow queries can be sampled through a screen-space adaptive mask.
 
 ## Example: Adaptive Static Shadow Mask
@@ -43,7 +44,19 @@ python entry_point.py
 | `--height <H>` | Render height | 1080 |
 | `--vsync` | Enable V-Sync | - |
 | `--no-srgb` | Keep linear color space in output | - |
-| `--renderer path-tracing\|texture-space` | Select the standard or Mesh Colors renderer | path-tracing |
+| `--renderer path-tracing\|texture-space\|surface-probe` | Select the standard, Mesh Colors, or sparse surface-probe renderer | path-tracing |
+| `--surface-probe-count <N>` | Target surface-site budget before double-sided expansion | 20480 |
+| `--surface-probe-oversample <N>` | Candidate multiplier before weighted sample elimination | 5 |
+| `--surface-probe-sampler-backend auto\|cpp\|python` | Weighted sample elimination backend | auto |
+| `--surface-probe-profile-build` | Print sampled startup timings for scene import, WSE/repair, octree packing, GPU upload, and shader initialization | - |
+| `--surface-probe-repair-budget-ratio <R>` | Maximum post-WSE deficit-repair sites relative to the base budget | 0.30 |
+| `--surface-probe-repair-min-gather <N>` | Primary-radius gather count targeted by repair | 4 |
+| `--surface-probe-max-density-multiplier <M>` | Clamp for adaptive density `m(x)=1/f(x)` | 8 |
+| `--surface-probe-no-adaptive-wse` | Restore area-only candidate allocation and uniform-radius WSE | - |
+| `--surface-probe-vertex-fallback` | Enable the legacy triangle-local vertex-irradiance fallback for A/B comparison | - |
+| `--surface-probe-debug-view beauty\|count\|support\|density\|vertex-fallback\|probe-self-hit` | Initial resolve or false-color diagnostic | beauty |
+| `--surface-probe-show-gather-count` | Show the false-color reconstruction-neighbor count | - |
+| `--surface-probe-screen-accum` | Apply optional screen accumulation after probe resolve | - |
 | `--texture-space-texels-per-unit <N>` | World-space Mesh Colors density | 16 |
 | `--texture-space-min-resolution <N>` | Minimum per-triangle grid resolution | 4 |
 | `--texture-space-max-resolution <N>` | Maximum per-triangle grid resolution | 64 |
@@ -92,6 +105,80 @@ irradiance slot. Only materials explicitly marked `double_sided` allocate and
 trace an additional 16-byte back slot, so single-sided geometry has no
 double-sided cache overhead. glTF `doubleSided` is preserved during material
 import; other material sources default to single-sided.
+
+## Surface-Probe Mode
+
+The surface-probe renderer first estimates compatible surface support `f(x)`
+with the real reconstruction kernel. It allocates the exact base budget by
+`area*m(x)`, draws triangle candidates from the same density (including all
+triangle centroids), and applies variable-radius weighted sample elimination.
+The per-candidate radius is proportional to
+`sqrt(mean(m) / m(x))`, so the requested density changes without changing the
+base-site total. A post-WSE audit then evaluates
+the same radius, normal, plane, and compact-kernel tests used by the GPU gather.
+It greedily appends probes to low-support boundary, narrow, disconnected, and
+high-curvature regions, up to 30% of the base site count by default. The base
+Poisson distribution and kernel radius are left unchanged. A final protected
+coverage-closure pass takes audit points that still have zero primary-radius
+support, creates enough colocated face-local sites to target four gathered
+probes, and appends them without another WSE pass or the ordinary 30% repair
+cap. Face-local inset triangle corners are included in the audit so seams and
+small triangles cannot rely only on random candidates. Primary hits
+reconstruct progressively traced irradiance through one point octree per scene
+instance. Resolve retains the 96 strongest geometric candidates and
+reconstructs from the strongest 32 compatible probes. If
+the primary radius produces fewer than the configured minimum gather count,
+the double-radius fallback contributes unique, downweighted samples.
+The post-WSE deficit repair and runtime resolve use the same distance, normal,
+plane, compact-kernel, 96-candidate, and 32-gather rules. Protected sites enter
+the same point octree, compact kernel, and normalized reconstruction as base
+and ordinary repair sites. The older
+per-vertex barycentric fallback is now disabled by default because it forms a
+separate piecewise-linear estimator. It remains available through
+`--surface-probe-vertex-fallback` for A/B tests; only then are vertex anchors
+allocated and progressively traced.
+
+```bash
+# Interactive preview with 37k surface sites
+python entry_point.py --renderer surface-probe --surface-probe-count 37000
+
+# Inspect reconstruction coverage; one frame is sufficient
+python entry_point.py --renderer surface-probe --surface-probe-count 37000 \
+  --surface-probe-debug-view count --headless --frames 1 \
+  --width 512 --height 512 --output surface_probe_gather.png
+
+# Inspect compatible surface support f(x) or its inverse density m(x)
+python entry_point.py --renderer surface-probe --surface-probe-count 37000 \
+  --surface-probe-debug-view support --headless --frames 1 \
+  --width 512 --height 512 --output surface_probe_support.png
+```
+
+The interactive Surface Probe UI exposes the reconstruction diagnostics through the
+`Debug View` combo. `f(x)` is the compatible surface area under the actual
+distance/normal/plane reconstruction kernel, normalized by the infinite-flat-
+surface kernel integral `pi*R^2/3`. `m(x)` is `clamp(1/f(x), 1, M)` and uses a
+logarithmic false-color scale.
+Probe reconstruction intentionally performs no query-to-probe visibility
+test. `Probe Self-hit Rate` counts
+probe-path bounce hits that return to the source primitive, or hit the same
+instance within four times the actual ray-origin offset, and displays the
+weighted suspects per probe update on a logarithmic scale.
+`Vertex Fallback Weight` shows where the triangle-local result contributes;
+when launched with `--surface-probe-vertex-fallback`, the UI checkbox toggles
+that legacy path without rebuilding the layout.
+
+Adaptive WSE is enabled by default. Its native implementation computes initial
+candidate weights in parallel and uses an indexed mutable heap for exact
+neighbor-weight updates. When a candidate is eliminated, its contribution is
+removed using each surviving neighbor's own local radius; this asymmetric rule
+prevents coarse-radius regions from incorrectly suppressing fine-detail sites.
+
+`auto` prefers the native C++ sampler and falls back to the Python reference
+implementation only when the native library cannot be built or loaded. The
+native target is compiled lazily through CMake and requires a C++17 compiler.
+Use `--surface-probe-sampler-backend cpp` to require it or `python` for parity
+and regression testing. The native backend vendors the MIT-licensed cyCodeBase
+weighted sample elimination headers at a fixed upstream commit.
 
 ## Adding a New Render Pass
 

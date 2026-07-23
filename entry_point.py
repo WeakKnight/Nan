@@ -1,9 +1,9 @@
 import argparse
+import time
 from dataclasses import asdict
 import json
 import math
 from pathlib import Path
-import time
 
 import numpy as np
 
@@ -123,9 +123,114 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--renderer",
-        choices=("path-tracing", "texture-space"),
+        choices=("path-tracing", "texture-space", "surface-probe"),
         default="path-tracing",
         help="Interactive/headless renderer mode.",
+    )
+    parser.add_argument(
+        "--surface-probe-count",
+        type=int,
+        default=20_480,
+        help="Target surface probe budget used by the surface-probe renderer.",
+    )
+    parser.add_argument(
+        "--surface-probe-oversample",
+        type=int,
+        default=5,
+        help="Candidate oversample factor before Weighted Sample Elimination.",
+    )
+    parser.add_argument(
+        "--surface-probe-seed",
+        type=int,
+        default=1,
+        help="Deterministic seed for surface probe candidate generation.",
+    )
+    parser.add_argument(
+        "--surface-probe-samples-per-probe",
+        type=int,
+        default=1,
+        help="Hemisphere samples traced per surface probe and frame.",
+    )
+    parser.add_argument(
+        "--surface-probe-max-bounces",
+        type=int,
+        default=3,
+        help="Maximum indirect path bounces for surface probe baking.",
+    )
+    parser.add_argument(
+        "--surface-probe-kernel-radius-scale",
+        type=float,
+        default=2.5,
+        help="Reconstruction kernel radius as a multiple of local probe spacing.",
+    )
+    parser.add_argument(
+        "--surface-probe-normal-angle",
+        type=float,
+        default=45.0,
+        help="Normal compatibility threshold in degrees for surface probe gather.",
+    )
+    parser.add_argument(
+        "--surface-probe-repair-budget-ratio",
+        type=float,
+        default=0.30,
+        help="Maximum post-WSE deficit-repair sites as a fraction of the base budget.",
+    )
+    parser.add_argument(
+        "--surface-probe-repair-min-gather",
+        type=int,
+        default=4,
+        help="Minimum primary-radius gather count targeted by post-WSE repair.",
+    )
+    parser.add_argument(
+        "--surface-probe-max-density-multiplier",
+        type=float,
+        default=8.0,
+        help="Upper clamp for adaptive density m(x)=1/f(x).",
+    )
+    parser.add_argument(
+        "--surface-probe-no-adaptive-wse",
+        action="store_true",
+        help="Disable area*m candidate allocation and variable-radius WSE.",
+    )
+    parser.add_argument(
+        "--surface-probe-vertex-fallback",
+        action="store_true",
+        help="Enable the legacy triangle-local vertex fallback for A/B comparison.",
+    )
+    parser.add_argument(
+        "--surface-probe-no-vertex-fallback",
+        action="store_true",
+        help="Deprecated compatibility flag; vertex fallback is disabled by default.",
+    )
+    parser.add_argument(
+        "--surface-probe-debug-view",
+        choices=(
+            "beauty", "count", "support", "density", "vertex-fallback",
+            "probe-self-hit"
+        ),
+        default="beauty",
+        help="Initial surface-probe resolve/debug visualization.",
+    )
+    parser.add_argument(
+        "--surface-probe-show-gather-count",
+        action="store_true",
+        help="Show a false-color surface probe gather-count diagnostic.",
+    )
+    parser.add_argument(
+        "--surface-probe-screen-accum",
+        action="store_true",
+        help="Apply a second screen-space accumulation after resolving the probe running mean.",
+    )
+    parser.add_argument(
+        "--surface-probe-sampler-backend",
+        choices=("auto", "cpp", "python"),
+        default="auto",
+        help="Weighted sample elimination backend used to build surface probes.",
+    )
+    parser.add_argument(
+        "--surface-probe-profile-build",
+        action="store_true",
+        help="Print sampled startup timings for surface-probe construction and GPU setup.",
     )
     parser.add_argument(
         "--texture-space-texels-per-unit",
@@ -3306,6 +3411,7 @@ def main() -> None:
 
     from app import App, AppConfig
     from path_tracing_renderer import PathTracingRenderer
+    from surface_probe_path_tracing_renderer import SurfaceProbePathTracingRenderer
     from texture_space_path_tracing_renderer import TextureSpacePathTracingRenderer
 
     static_shadow_mode = _parse_static_shadow_mode(args.static_shadow_mode)
@@ -3318,6 +3424,44 @@ def main() -> None:
             max_texels=max(1, int(args.texture_space_max_texels)),
             samples_per_texel=max(1, int(args.texture_space_samples_per_texel)),
             max_bounces=max(1, int(args.texture_space_max_bounces)),
+        )
+    elif args.renderer == "surface-probe":
+        renderer = SurfaceProbePathTracingRenderer(
+            target_probe_count=max(1, int(args.surface_probe_count)),
+            oversample_factor=max(1, int(args.surface_probe_oversample)),
+            seed=int(args.surface_probe_seed),
+            samples_per_probe=max(1, int(args.surface_probe_samples_per_probe)),
+            max_bounces=max(1, int(args.surface_probe_max_bounces)),
+            kernel_radius_scale=max(
+                0.5, float(args.surface_probe_kernel_radius_scale)
+            ),
+            normal_angle_degrees=float(args.surface_probe_normal_angle),
+            repair_budget_ratio=max(
+                0.0, float(args.surface_probe_repair_budget_ratio)
+            ),
+            repair_min_gather=max(
+                1, min(32, int(args.surface_probe_repair_min_gather))
+            ),
+            max_density_multiplier=max(
+                1.0, float(args.surface_probe_max_density_multiplier)
+            ),
+            adaptive_wse=not bool(args.surface_probe_no_adaptive_wse),
+            vertex_fallback=(
+                bool(args.surface_probe_vertex_fallback)
+                and not bool(args.surface_probe_no_vertex_fallback)
+            ),
+            profile_build=bool(args.surface_probe_profile_build),
+            debug_view={
+                "beauty": 0,
+                "count": 1,
+                "support": 2,
+                "density": 3,
+                "vertex-fallback": 4,
+                "probe-self-hit": 5,
+            }[str(args.surface_probe_debug_view)],
+            show_gather_count=bool(args.surface_probe_show_gather_count),
+            use_screen_accumulation=bool(args.surface_probe_screen_accum),
+            sampler_backend=str(args.surface_probe_sampler_backend),
         )
     else:
         renderer = PathTracingRenderer()
@@ -3342,12 +3486,27 @@ def main() -> None:
         static_shadow_mask_mode=args.static_shadow_mask,
         static_shadow_mask_threshold=max(0.0, float(args.static_shadow_mask_threshold)),
         static_shadow_mask_bootstrap_passes=max(0, min(4, int(args.static_shadow_mask_bootstrap_passes))),
+        startup_profile=bool(args.surface_probe_profile_build),
     )
 
+    app_start = time.perf_counter()
     app = App(config=config)
+    if args.surface_probe_profile_build:
+        print(
+            f"[SurfaceProbeProfile] app_scene_and_gpu_init: "
+            f"{time.perf_counter() - app_start:.3f}s",
+            flush=True,
+        )
     if app.extensions.has("static_shadow_sst"):
         _apply_runtime_sst_options(app.scene, args)
+    renderer_start = time.perf_counter()
     app.set_renderer(renderer)
+    if args.surface_probe_profile_build:
+        print(
+            f"[SurfaceProbeProfile] set_renderer_total: "
+            f"{time.perf_counter() - renderer_start:.3f}s",
+            flush=True,
+        )
     app.main_loop()
 
 

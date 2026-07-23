@@ -51,6 +51,13 @@ struct StaticShadowDepthMapData {
     uint pad0;
 };
 
+struct TriangleSpawnData
+{
+    float3 position;
+    float3 normal;
+    float offset;
+};
+
 static const uint SHADOW_MODE_REALTIME = 0;
 static const uint SHADOW_MODE_DEPTH_TEXTURE = 1;
 static const uint SHADOW_MODE_SST = 2;
@@ -168,6 +175,99 @@ struct Scene {
         };
     }
 
+    TriangleSpawnData get_triangle_spawn_data(
+        float3 v0,
+        float3 v1,
+        float3 v2,
+        float2 bary,
+        float4x4 object_to_world,
+        float4x4 inverse_transpose_transform)
+    {
+        // Bounds for fp32 reconstruction, NVIDIA RTX triangle intersection,
+        // and affine transform error.
+        static const float c0 = 5.9604644775390625e-8;
+        static const float c1 = 1.7881397695873602e-7;
+        static const float c2 = 1.1920931797249068e-7;
+
+        precise float3 edge1 = v1 - v0;
+        precise float3 edge2 = v2 - v0;
+        // Add the base vertex last to minimize object-space error.
+        precise float3 object_position = v0
+            + mad(bary.x, edge1, bary.y * edge2);
+        float3 object_normal = cross(edge1, edge2);
+
+        // Explicit affine transform keeps translation last.
+        precise float3 world_position;
+        world_position.x = object_to_world[0][3]
+            + mad(object_to_world[0][0], object_position.x,
+            mad(object_to_world[0][1], object_position.y,
+                object_to_world[0][2] * object_position.z));
+        world_position.y = object_to_world[1][3]
+            + mad(object_to_world[1][0], object_position.x,
+            mad(object_to_world[1][1], object_position.y,
+                object_to_world[1][2] * object_position.z));
+        world_position.z = object_to_world[2][3]
+            + mad(object_to_world[2][0], object_position.x,
+            mad(object_to_world[2][1], object_position.y,
+                object_to_world[2][2] * object_position.z));
+
+        float3 world_normal_unscaled = mul(
+            (float3x3)inverse_transpose_transform, object_normal);
+        float world_scale = rsqrt(max(
+            dot(world_normal_unscaled, world_normal_unscaled), 1e-30));
+        float3 world_normal = world_normal_unscaled * world_scale;
+
+        float3 extent3 = abs(edge1) + abs(edge2)
+            + abs(abs(edge1) - abs(edge2));
+        float extent = max(max(extent3.x, extent3.y), extent3.z);
+        float3 object_error = c0 * abs(v0) + c1 * extent;
+
+        float3 abs_object_position = abs(object_position);
+        float3 world_error;
+        world_error.x = c1 * dot(
+            abs(object_to_world[0].xyz), abs_object_position)
+            + c2 * abs(object_to_world[0][3]);
+        world_error.y = c1 * dot(
+            abs(object_to_world[1].xyz), abs_object_position)
+            + c2 * abs(object_to_world[1][3]);
+        world_error.z = c1 * dot(
+            abs(object_to_world[2].xyz), abs_object_position)
+            + c2 * abs(object_to_world[2][3]);
+
+        // inverse_transpose_transform is transpose(world_to_object).
+        float4 absolute_world_position = float4(abs(world_position), 1.0);
+        float3 traversal_error = float3(
+            dot(abs(float4(
+                inverse_transpose_transform[0][0],
+                inverse_transpose_transform[1][0],
+                inverse_transpose_transform[2][0],
+                inverse_transpose_transform[3][0])),
+                absolute_world_position),
+            dot(abs(float4(
+                inverse_transpose_transform[0][1],
+                inverse_transpose_transform[1][1],
+                inverse_transpose_transform[2][1],
+                inverse_transpose_transform[3][1])),
+                absolute_world_position),
+            dot(abs(float4(
+                inverse_transpose_transform[0][2],
+                inverse_transpose_transform[1][2],
+                inverse_transpose_transform[2][2],
+                inverse_transpose_transform[3][2])),
+                absolute_world_position));
+        object_error += c2 * traversal_error;
+
+        float object_offset = dot(object_error, abs(object_normal));
+        float world_offset = dot(world_error, abs(world_normal));
+        world_offset = mad(world_scale, object_offset, world_offset);
+
+        TriangleSpawnData result;
+        result.position = world_position;
+        result.normal = world_normal;
+        result.offset = world_offset;
+        return result;
+    }
+
     ShadingData get_shading_data(HitInfo hit_info, const float3 view_direction)
     {
         uint instance_id = hit_info.instance_id;
@@ -186,19 +286,20 @@ struct Scene {
         Vertex v2 = g_scene.vertices[mesh_desc.vertex_offset + i2];
         float3 b = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
 
-        float3 position = mul(transform, float4(b.x * v0.position + b.y * v1.position + b.z * v2.position, 1.0)).xyz;
+        TriangleSpawnData spawn = get_triangle_spawn_data(
+            v0.position,
+            v1.position,
+            v2.position,
+            bary,
+            transform,
+            inverse_transpose_transform);
+        float3 position = spawn.position;
         float2 uv = b.x * v0.uv + b.y * v1.uv + b.z * v2.uv;
         float3 geometry_normal = normalize(
             mul(inverse_transpose_transform, float4(b.x * v0.normal + b.y * v1.normal + b.z * v2.normal, 0)).xyz
         );
         float3 shading_normal = geometry_normal;
-        float3 object_space_flat_normal = normalize(cross(
-            v1.position - v0.position,
-            v2.position - v0.position));
-
-        float3 face_normal = normalize(
-            mul((float3x3)inverse_transpose_transform, object_space_flat_normal)
-        );
+        float3 face_normal = spawn.normal;
 
         MaterialDesc material = g_scene.get_material(hit_info);
 
@@ -286,6 +387,9 @@ struct Scene {
 
         ShadingData shading_data;
         shading_data.position = position;
+        shading_data.ray_origin_front = position + spawn.offset * face_normal;
+        shading_data.ray_origin_back = position - spawn.offset * face_normal;
+        shading_data.ray_origin_offset = spawn.offset;
         shading_data.view_direction = view_direction;
         shading_data.geometry_frame = Frame(geometry_normal);
         shading_data.shading_frame = Frame(shading_normal);

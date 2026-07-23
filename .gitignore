@@ -1,16 +1,56 @@
-__pycache__
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
 venv/
-*.lz4
-*.rad
-code_ref/
-.claude/
-.codebuddy/
+
+# Editors and operating-system metadata
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.DS_Store
+Thumbs.db
+
+# Native build outputs
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+*.vcxproj.user
+sst_encoder_build/
+surface_probe_sampler_build/
+
+# Generated render, profiling, and capture outputs
+artifacts/
+surface_probe_cornell.png
 headless_output.png
 headless_smoke.png
 *_smoke.png
+*.log
+*.rad
+*.lz4
+
+# Generated static-shadow reports
 sst_bistro_*.json
 sst_bistro_*.md
 sst_bistro_summary.md
 static_shadow_compare_bistro*/
 static_shadow_compare_bistro*.md
-sst_encoder_build/
+
+# Local tools and reference checkouts
+code_ref/
+.claude/
+.codebuddy/

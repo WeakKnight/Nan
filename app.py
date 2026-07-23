@@ -10,6 +10,7 @@ from slangpy.ui import Context
 import slangpy as spy
 import json
 import math
+import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -44,6 +45,7 @@ class AppConfig:
     static_shadow_mask_mode: str = "off"
     static_shadow_mask_threshold: float = 0.02
     static_shadow_mask_bootstrap_passes: int = 2
+    startup_profile: bool = False
 
 class App:
     def __init__(self, config: Optional[AppConfig] = None):
@@ -51,6 +53,20 @@ class App:
 
         self.config: AppConfig = config or AppConfig()
         self.headless: bool = self.config.headless
+        profile_origin = time.perf_counter()
+        profile_previous = profile_origin
+
+        def profile_mark(label: str) -> None:
+            nonlocal profile_previous
+            now = time.perf_counter()
+            if self.config.startup_profile:
+                print(
+                    f"[SurfaceProbeProfile] {label}: "
+                    f"{now - profile_previous:.3f}s "
+                    f"(app_total={now - profile_origin:.3f}s)",
+                    flush=True,
+                )
+            profile_previous = now
 
         self.window: None | spy.Window = None
         if not self.headless:
@@ -60,6 +76,7 @@ class App:
                 title="Nan",
                 resizable=True,
             )
+        profile_mark("window_create")
         self.shader_defines: dict[str, str] = {"USE_RAYTRACING_PIPELINE": "0"}
         if self.headless:
             self.shader_defines["HEADLESS_MODE"] = "1"
@@ -83,6 +100,7 @@ class App:
                 height=self.window.height,
                 vsync=self.config.vsync,
             )
+        profile_mark("device_and_surface_create")
 
         self.output_texture: spy.Texture | None = None  # type: ignore (will be set immediately)
         self.render_data: RenderData = RenderData(self.device)
@@ -96,19 +114,23 @@ class App:
             self.window.on_resize = self.on_resize
 
         self.scene_node: SceneNode = self._load_scene(self.config.scene_path)
+        profile_mark("scene_asset_import")
         self._apply_scene_camera_config()
 
         self.event_dispatcher: SyncEventDispatcher = event_dispatcher.SyncEventDispatcher()
         self.scene: Scene = Scene(self.device, self.scene_node, self.event_dispatcher)
+        profile_mark("scene_gpu_resources_and_acceleration_structures")
         self.extensions: ExtensionManager = ExtensionManager(self.config.enabled_extensions)
         self.extensions.initialize(self)
         self.scene.extensions = self.extensions
+        profile_mark("extensions_initialize")
 
         self.camera_controller: CameraController = CameraController(self.scene_node.camera)
         self.camera_controller.move_test = self.config.camera_move_test
 
         self.ui: Context | None = spy.ui.Context(self.device) if not self.headless else None
         self.renderer: Renderer | None = None
+        profile_mark("camera_and_ui_initialize")
 
         self.render_doc_is_available = (
             spy.renderdoc.is_available() and not self.headless
