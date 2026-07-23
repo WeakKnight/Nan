@@ -9,10 +9,17 @@ StructuredBuffer<SurfaceProbe> g_surface_probes;
 StructuredBuffer<uint4> g_surface_probe_nodes;
 StructuredBuffer<SurfaceProbeInstanceInfo> g_surface_probe_instances;
 StructuredBuffer<uint4> g_triangle_vertex_probes;
+StructuredBuffer<uint> g_vertex_lighting_rgbm;
+StructuredBuffer<float4> g_vertex_lighting_target;
+StructuredBuffer<uint4> g_vertex_lighting_triangle_map;
+StructuredBuffer<uint2> g_vertex_lighting_instance_offsets;
 uniform uint g_debug_view;
 uniform float g_max_density_multiplier;
 uniform uint g_min_gather_count;
 uniform uint g_use_vertex_fallback;
+uniform uint g_use_vertex_lighting;
+uniform uint g_vertex_lighting_built;
+uniform float g_vertex_lighting_rgbm_range;
 
 float3 gather_count_debug_color(uint count)
 {
@@ -104,89 +111,6 @@ float3 probe_self_hit_debug_color(float rate)
         float3(1.0, 1.0, 0.0),
         float3(1.0, 0.0, 0.0),
         (value - 2.0 / 3.0) * 3.0);
-}
-
-void surface_probe_select_strongest(
-    uint candidate_count,
-    uint candidate_indices[SURFACE_PROBE_MAX_CANDIDATES],
-    float candidate_weights[SURFACE_PROBE_MAX_CANDIDATES],
-    out uint selected_count,
-    out uint selected_indices[SURFACE_PROBE_MAX_GATHER],
-    out float selected_weights[SURFACE_PROBE_MAX_GATHER])
-{
-    selected_count = 0;
-    uint3 consumed_mask = uint3(0);
-
-    // The octree gather can return up to 96 candidates. Keep the strongest
-    // 32 so reconstruction and the CPU deficit audit use the same estimator.
-    for (uint selection = 0;
-         selection < candidate_count
-             && selected_count < SURFACE_PROBE_MAX_GATHER;
-         selection++)
-    {
-        uint strongest = 0;
-        float strongest_weight = -1.0;
-        for (uint i = 0; i < candidate_count; i++)
-        {
-            uint word = i >> 5;
-            uint bit = 1u << (i & 31u);
-            bool consumed = word == 0
-                ? (consumed_mask.x & bit) != 0
-                : (word == 1
-                    ? (consumed_mask.y & bit) != 0
-                    : (consumed_mask.z & bit) != 0);
-            if (!consumed && candidate_weights[i] > strongest_weight)
-            {
-                strongest = i;
-                strongest_weight = candidate_weights[i];
-            }
-        }
-        uint strongest_word = strongest >> 5;
-        uint strongest_bit = 1u << (strongest & 31u);
-        if (strongest_word == 0)
-            consumed_mask.x |= strongest_bit;
-        else if (strongest_word == 1)
-            consumed_mask.y |= strongest_bit;
-        else
-            consumed_mask.z |= strongest_bit;
-        selected_indices[selected_count] = candidate_indices[strongest];
-        selected_weights[selected_count] = strongest_weight;
-        selected_count += 1;
-    }
-}
-
-void surface_probe_merge_fallback(
-    uint fallback_count,
-    uint fallback_indices[SURFACE_PROBE_MAX_GATHER],
-    float fallback_weights[SURFACE_PROBE_MAX_GATHER],
-    inout uint gathered_count,
-    inout uint gathered_indices[SURFACE_PROBE_MAX_GATHER],
-    inout float gathered_weights[SURFACE_PROBE_MAX_GATHER])
-{
-    // The wider kernel is an emergency support tier. Keep all primary-radius
-    // weights and downweight only newly introduced 2R samples.
-    static const float FALLBACK_WEIGHT_SCALE = 0.25;
-    for (uint fallback = 0;
-         fallback < fallback_count
-             && gathered_count < SURFACE_PROBE_MAX_GATHER;
-         fallback++)
-    {
-        bool duplicate = false;
-        for (uint primary = 0; primary < gathered_count; primary++)
-        {
-            if (gathered_indices[primary] == fallback_indices[fallback])
-            {
-                duplicate = true;
-                break;
-            }
-        }
-        if (duplicate)
-            continue;
-        gathered_indices[gathered_count] = fallback_indices[fallback];
-        gathered_weights[gathered_count] =
-            fallback_weights[fallback] * FALLBACK_WEIGHT_SCALE;
-        gathered_count += 1;
-    }
 }
 
 float3 surface_probe_sample_irradiance(
@@ -325,6 +249,54 @@ bool surface_probe_sample_vertex_fallback(
     return true;
 }
 
+float3 vertex_lighting_decode_rgbm(uint packed)
+{
+    float4 encoded = float4(
+        packed & 255u,
+        (packed >> 8) & 255u,
+        (packed >> 16) & 255u,
+        (packed >> 24) & 255u) / 255.0;
+    return encoded.xyz * encoded.w * g_vertex_lighting_rgbm_range;
+}
+
+bool surface_probe_sample_vertex_lighting(
+    HitInfo hit,
+    ShadingData shading,
+    out float3 irradiance,
+    out float confidence)
+{
+    if (g_vertex_lighting_built == 0)
+    {
+        irradiance = float3(0.0);
+        confidence = 0.0;
+        return false;
+    }
+    uint2 instance_info =
+        g_vertex_lighting_instance_offsets[hit.instance_id];
+    uint side = shading.double_sided && !shading.front_facing ? 1u : 0u;
+    uint4 vertices = g_vertex_lighting_triangle_map[
+        instance_info.x + hit.primitive_index * 2u + side];
+    if (vertices.w == 0)
+    {
+        irradiance = float3(0.0);
+        confidence = 0.0;
+        return false;
+    }
+    float3 barycentrics = hit.get_barycentrics();
+    irradiance =
+        barycentrics.x * vertex_lighting_decode_rgbm(
+            g_vertex_lighting_rgbm[vertices.x])
+        + barycentrics.y * vertex_lighting_decode_rgbm(
+            g_vertex_lighting_rgbm[vertices.y])
+        + barycentrics.z * vertex_lighting_decode_rgbm(
+            g_vertex_lighting_rgbm[vertices.z]);
+    confidence =
+        barycentrics.x * g_vertex_lighting_target[vertices.x].w
+        + barycentrics.y * g_vertex_lighting_target[vertices.y].w
+        + barycentrics.z * g_vertex_lighting_target[vertices.z].w;
+    return true;
+}
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void compute_main(uint3 dispatch_thread_id : SV_DispatchThreadID)
@@ -339,21 +311,30 @@ void compute_main(uint3 dispatch_thread_id : SV_DispatchThreadID)
     HitInfo hit = g_scene.intersect(ray);
     if (!hit.valid)
     {
-        float3 miss_color = g_debug_view != 0
-            ? float3(0.02)
-            : g_scene.sample_sky_with_sun_disk(ray.dir);
+        bool beauty_like = g_debug_view == 0 || g_debug_view == 6;
+        float3 miss_color = beauty_like
+            ? g_scene.sample_sky_with_sun_disk(ray.dir)
+            : float3(0.02);
         g_output[pixel] = float4(miss_color, 1.0);
         return;
     }
 
     ShadingData shading = g_scene.get_shading_data(hit, -ray.dir);
+    bool beauty_like = g_debug_view == 0 || g_debug_view == 6;
+    float3 realtime_sun = float3(0.0);
+    if (beauty_like)
+    {
+        RNG preview_rng = RNG(pixel, g_scene.frame_index);
+        realtime_sun = g_scene.sample_directional_light(
+            shading, preview_rng.next_2d()).xyz;
+    }
     SurfaceProbeInstanceInfo instance_info = surface_probe_get_instance(
         g_surface_probe_instances, hit.instance_id);
     if (instance_info.offsets.w == 0)
     {
-        float3 empty_color = g_debug_view != 0
-            ? gather_count_debug_color(0)
-            : shading.emissive;
+        float3 empty_color = beauty_like
+            ? shading.emissive + realtime_sun
+            : gather_count_debug_color(0);
         g_output[pixel] = float4(empty_color, 1.0);
         return;
     }
@@ -416,6 +397,36 @@ void compute_main(uint3 dispatch_thread_id : SV_DispatchThreadID)
             probe_self_hit_debug_color(probe_self_hit_rate), 1.0);
         return;
     }
-    float3 color = shading.emissive + shading.diffuse * INV_PI * irradiance;
+    float3 baked_vertex_irradiance;
+    float vertex_lighting_confidence;
+    bool has_vertex_lighting = surface_probe_sample_vertex_lighting(
+        hit,
+        shading,
+        baked_vertex_irradiance,
+        vertex_lighting_confidence);
+    if (g_debug_view == 6)
+    {
+        float3 vertex_color = has_vertex_lighting
+            ? shading.emissive
+                + realtime_sun
+                + shading.diffuse * INV_PI * baked_vertex_irradiance
+            : float3(1.0, 0.0, 1.0);
+        g_output[pixel] = float4(vertex_color, 1.0);
+        return;
+    }
+    if (g_debug_view == 7)
+    {
+        g_output[pixel] = float4(
+            has_vertex_lighting
+                ? support_debug_color(vertex_lighting_confidence)
+                : float3(1.0, 0.0, 1.0),
+            1.0);
+        return;
+    }
+    if (g_use_vertex_lighting != 0 && has_vertex_lighting)
+        irradiance = baked_vertex_irradiance;
+    float3 color = shading.emissive
+        + realtime_sun
+        + shading.diffuse * INV_PI * irradiance;
     g_output[pixel] = float4(color, 1.0);
 }

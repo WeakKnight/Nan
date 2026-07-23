@@ -231,6 +231,85 @@ void surface_probe_gather(
     }
 }
 
+void surface_probe_select_strongest(
+    uint candidate_count,
+    uint candidate_indices[SURFACE_PROBE_MAX_CANDIDATES],
+    float candidate_weights[SURFACE_PROBE_MAX_CANDIDATES],
+    out uint selected_count,
+    out uint selected_indices[SURFACE_PROBE_MAX_GATHER],
+    out float selected_weights[SURFACE_PROBE_MAX_GATHER])
+{
+    selected_count = 0;
+    uint3 consumed_mask = uint3(0);
+
+    for (uint selection = 0;
+         selection < candidate_count
+             && selected_count < SURFACE_PROBE_MAX_GATHER;
+         selection++)
+    {
+        uint strongest = 0;
+        float strongest_weight = -1.0;
+        for (uint i = 0; i < candidate_count; i++)
+        {
+            uint word = i >> 5;
+            uint bit = 1u << (i & 31u);
+            bool consumed = word == 0
+                ? (consumed_mask.x & bit) != 0
+                : (word == 1
+                    ? (consumed_mask.y & bit) != 0
+                    : (consumed_mask.z & bit) != 0);
+            if (!consumed && candidate_weights[i] > strongest_weight)
+            {
+                strongest = i;
+                strongest_weight = candidate_weights[i];
+            }
+        }
+        uint strongest_word = strongest >> 5;
+        uint strongest_bit = 1u << (strongest & 31u);
+        if (strongest_word == 0)
+            consumed_mask.x |= strongest_bit;
+        else if (strongest_word == 1)
+            consumed_mask.y |= strongest_bit;
+        else
+            consumed_mask.z |= strongest_bit;
+        selected_indices[selected_count] = candidate_indices[strongest];
+        selected_weights[selected_count] = strongest_weight;
+        selected_count += 1;
+    }
+}
+
+void surface_probe_merge_fallback(
+    uint fallback_count,
+    uint fallback_indices[SURFACE_PROBE_MAX_GATHER],
+    float fallback_weights[SURFACE_PROBE_MAX_GATHER],
+    inout uint gathered_count,
+    inout uint gathered_indices[SURFACE_PROBE_MAX_GATHER],
+    inout float gathered_weights[SURFACE_PROBE_MAX_GATHER])
+{
+    static const float FALLBACK_WEIGHT_SCALE = 0.25;
+    for (uint fallback = 0;
+         fallback < fallback_count
+             && gathered_count < SURFACE_PROBE_MAX_GATHER;
+         fallback++)
+    {
+        bool duplicate = false;
+        for (uint primary = 0; primary < gathered_count; primary++)
+        {
+            if (gathered_indices[primary] == fallback_indices[fallback])
+            {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate)
+            continue;
+        gathered_indices[gathered_count] = fallback_indices[fallback];
+        gathered_weights[gathered_count] =
+            fallback_weights[fallback] * FALLBACK_WEIGHT_SCALE;
+        gathered_count += 1;
+    }
+}
+
 float3 surface_probe_reconstruct_irradiance(
     ByteAddressBuffer irradiance,
     StructuredBuffer<SurfaceProbe> probes,

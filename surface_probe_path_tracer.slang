@@ -131,8 +131,12 @@ float3 estimate_surface_irradiance(
     self_hit_suspect_count = 0u;
     for (uint sample_index = 0; sample_index < local_sample_count; sample_index++)
     {
-        float3 sample_irradiance =
-            g_scene.sample_directional_irradiance(surface, rng.next_2d());
+        // The probe cache is indirect-only. Sun light on the probe's own
+        // surface is evaluated in the preview resolve so it remains fully
+        // responsive to sun direction, intensity, and realtime visibility.
+        // Sun NEE at later path vertices remains here because that energy has
+        // bounced at least once before reaching this probe.
+        float3 sample_irradiance = float3(0.0);
         float4 direction_sample = cosine_sample_hemisphere(rng.next_2d());
         if (direction_sample.w > 1e-6)
         {

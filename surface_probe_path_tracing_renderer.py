@@ -7,6 +7,7 @@ from render_data import RenderData
 from scene import Scene
 from surface_probe_path_tracer import SurfaceProbePathTracer
 from surface_probe_resolve import SurfaceProbeResolve
+from surface_probe_vertex_lighting import SurfaceProbeVertexLighting
 from surface_probes import SURFACE_PROBE_PAYLOAD_SIZE, SurfaceProbeLayout
 from tone_mapper import ToneMapper
 
@@ -23,6 +24,8 @@ SURFACE_PROBE_DEBUG_VIEWS = (
     "Density m(x)",
     "Vertex Fallback Weight",
     "Probe Self-hit Rate",
+    "Vertex Lighting",
+    "Vertex Confidence",
 )
 
 
@@ -48,6 +51,10 @@ class SurfaceProbePathTracingRenderer:
         show_gather_count: bool = False,
         use_screen_accumulation: bool = False,
         sampler_backend: str = "auto",
+        build_vertex_lighting: bool = False,
+        vertex_lighting_build_iteration: int = 0,
+        vertex_lighting_smoothing_passes: int = 64,
+        vertex_lighting_smoothing_strength: float = 1.0,
     ):
         self.target_probe_count = max(1, int(target_probe_count))
         self.oversample_factor = max(1, int(oversample_factor))
@@ -65,11 +72,21 @@ class SurfaceProbePathTracingRenderer:
         self.adaptive_wse = bool(adaptive_wse)
         self.vertex_fallback = bool(vertex_fallback)
         self.profile_build = bool(profile_build)
-        self.debug_view = max(0, min(5, int(debug_view)))
+        self.debug_view = max(0, min(7, int(debug_view)))
         if show_gather_count:
             self.debug_view = 1
         self.use_screen_accumulation = bool(use_screen_accumulation)
         self.sampler_backend = sampler_backend
+        self.use_vertex_lighting = bool(build_vertex_lighting)
+        self.vertex_lighting_build_iteration = max(
+            0, int(vertex_lighting_build_iteration)
+        )
+        self.vertex_lighting_smoothing_passes = max(
+            0, int(vertex_lighting_smoothing_passes)
+        )
+        self.vertex_lighting_smoothing_strength = max(
+            0.0, float(vertex_lighting_smoothing_strength)
+        )
 
         self.reset_accumulator = True
         self.reset_probes = True
@@ -77,11 +94,18 @@ class SurfaceProbePathTracingRenderer:
         self.use_accum_check_box: spy.ui.CheckBox | None = None
         self.pause_check_box: spy.ui.CheckBox | None = None
         self.vertex_fallback_check_box: spy.ui.CheckBox | None = None
+        self.use_vertex_lighting_check_box: spy.ui.CheckBox | None = None
+        self.vertex_lighting_passes_slider: spy.ui.SliderInt | None = None
+        self.vertex_lighting_strength_slider: spy.ui.SliderFloat | None = None
+        self.vertex_lighting_rgbm_range_slider: spy.ui.SliderFloat | None = None
+        self.build_vertex_lighting_button: spy.ui.Button | None = None
         self.debug_view_combo: spy.ui.ComboBox | None = None
         self.status_text: spy.ui.Text | None = None
         self._output_size: tuple[int, int] | None = None
         self._previous_debug_view = self.debug_view
         self._previous_vertex_fallback = self.vertex_fallback
+        self._previous_use_vertex_lighting = self.use_vertex_lighting
+        self._build_vertex_lighting_requested = bool(build_vertex_lighting)
 
     def initialize(self, device: spy.Device, scene: Scene) -> None:
         initialize_start = time.perf_counter()
@@ -118,6 +142,21 @@ class SurfaceProbePathTracingRenderer:
             samples_per_probe=self.samples_per_probe,
             max_bounces=self.max_bounces,
             profile_sink=profile_sink,
+        )
+        self.vertex_lighting = SurfaceProbeVertexLighting(
+            device,
+            scene,
+            self.path_tracer,
+            profile_sink=profile_sink,
+        )
+        print(
+            "[VertexLightingCoverage] "
+            f"vertices={self.vertex_lighting.layout.vertex_count:,}; "
+            f"zero_projection="
+            f"{self.vertex_lighting.layout.zero_projection_vertex_count:,}; "
+            f"partial_projection="
+            f"{self.vertex_lighting.layout.partial_projection_vertex_count:,}; "
+            "zero/partial vertices use same-instance spatial gather fallback"
         )
         self.resolve = SurfaceProbeResolve(
             device,
@@ -239,6 +278,18 @@ class SurfaceProbePathTracingRenderer:
             f"f_p50={self.layout.support_f_p50:.3f}; "
             f"m_p95={self.layout.density_m_p95:.2f}"
         )
+        print(
+            "[VertexLighting] "
+            f"{self.vertex_lighting.layout.vertex_count:,} instance vertices, "
+            f"{self.vertex_lighting.layout.projection_sample_count:,} "
+            "area-projection contributions, "
+            f"{self.vertex_lighting.layout.edge_count:,} directed topology "
+            f"edges, {self.vertex_lighting.layout.weld_edge_count:,} seam "
+            f"welds, condition mean="
+            f"{self.vertex_lighting.layout.condition_mean:.2f}, "
+            f"p95={self.vertex_lighting.layout.condition_p95:.2f}, "
+            f"RGBM={self.vertex_lighting.layout.vertex_count * 4 / (1024 * 1024):.2f} MiB"
+        )
         if self.profile_build:
             status_logging_elapsed = (
                 time.perf_counter() - status_logging_start
@@ -287,8 +338,22 @@ class SurfaceProbePathTracingRenderer:
         return (
             self.debug_view
             if self.debug_view_combo is None
-            else max(0, min(5, int(self.debug_view_combo.value)))
+            else max(0, min(7, int(self.debug_view_combo.value)))
         )
+
+    def _use_vertex_lighting(self) -> bool:
+        requested = (
+            self.use_vertex_lighting
+            if self.use_vertex_lighting_check_box is None
+            else bool(self.use_vertex_lighting_check_box.value)
+        )
+        return requested and self.vertex_lighting.built
+
+    def _request_vertex_lighting_build(self) -> None:
+        self._build_vertex_lighting_requested = True
+        self.reset_accumulator = True
+        if self.status_text is not None:
+            self.status_text.text = "Vertex Lighting build queued..."
 
     def _request_probe_reset(self) -> None:
         self.reset_probes = True
@@ -321,6 +386,11 @@ class SurfaceProbePathTracingRenderer:
             self.reset_accumulator = True
             self._previous_vertex_fallback = use_vertex_fallback
 
+        use_vertex_lighting = self._use_vertex_lighting()
+        if use_vertex_lighting != self._previous_use_vertex_lighting:
+            self.reset_accumulator = True
+            self._previous_use_vertex_lighting = use_vertex_lighting
+
         probe_irradiance = render_data.get_buffer(
             SURFACE_PROBE_BUFFER_KEY,
             usage=spy.BufferUsage.unordered_access
@@ -351,6 +421,57 @@ class SurfaceProbePathTracingRenderer:
                 self.reset_probes = False
             self.probe_iteration += 1
 
+        vertex_lighting_rgbm = self.vertex_lighting.packed_buffer(render_data)
+        vertex_lighting_target = self.vertex_lighting.target_buffer(render_data)
+        if (
+            self._build_vertex_lighting_requested
+            and self.probe_iteration >= self.vertex_lighting_build_iteration
+        ):
+            smoothing_passes = (
+                self.vertex_lighting_smoothing_passes
+                if self.vertex_lighting_passes_slider is None
+                else int(self.vertex_lighting_passes_slider.value)
+            )
+            regularization_strength = (
+                self.vertex_lighting_smoothing_strength
+                if self.vertex_lighting_strength_slider is None
+                else float(self.vertex_lighting_strength_slider.value)
+            )
+            rgbm_range = (
+                32.0
+                if self.vertex_lighting_rgbm_range_slider is None
+                else float(self.vertex_lighting_rgbm_range_slider.value)
+            )
+            build_start = time.perf_counter()
+            vertex_lighting_rgbm = self.vertex_lighting.execute(
+                command_encoder,
+                render_data,
+                probe_irradiance,
+                min_gather_count=self.repair_min_gather,
+                smoothing_passes=smoothing_passes,
+                regularization_strength=regularization_strength,
+                rgbm_range=rgbm_range,
+            )
+            self._build_vertex_lighting_requested = False
+            self.reset_accumulator = True
+            if self.use_vertex_lighting_check_box is not None:
+                self.use_vertex_lighting_check_box.value = True
+            self.use_vertex_lighting = True
+            use_vertex_lighting = True
+            self._previous_use_vertex_lighting = True
+            print(
+                "[VertexLighting] submitted "
+                f"{self.vertex_lighting.layout.vertex_count:,} vertices, "
+                f"{self.vertex_lighting.layout.zero_projection_vertex_count:,} "
+                "zero-projection fallback vertices, "
+                f"{self.vertex_lighting.layout.partial_projection_vertex_count:,} "
+                "partial-blend vertices, "
+                f"{smoothing_passes} smoothing passes, "
+                f"strength={regularization_strength:.3f}, "
+                f"RGBM range={rgbm_range:.1f} in "
+                f"{time.perf_counter() - build_start:.3f}s CPU"
+            )
+
         resolve_texture = render_data.get_texture(
             "surface_probe_renderer.resolve",
             width=output.width,
@@ -377,8 +498,12 @@ class SurfaceProbePathTracingRenderer:
             debug_view=debug_view,
             min_gather_count=self.repair_min_gather,
             use_vertex_fallback=use_vertex_fallback,
+            vertex_lighting=self.vertex_lighting,
+            vertex_lighting_rgbm=vertex_lighting_rgbm,
+            vertex_lighting_target=vertex_lighting_target,
+            use_vertex_lighting=use_vertex_lighting,
         )
-        if debug_view != 0:
+        if debug_view not in (0, 6):
             command_encoder.blit(output, resolve_texture)
             if self.status_text is not None:
                 if debug_view == 1:
@@ -403,10 +528,16 @@ class SurfaceProbePathTracingRenderer:
                         "Vertex fallback weight: blue=0; green/yellow=blend; "
                         "red/magenta=triangle-local fallback dominates"
                     )
-                else:
+                elif debug_view == 5:
                     self.status_text.text = (
                         "Probe path self-hit suspects/update (log): "
                         "dark blue=0; cyan~1e-5; yellow~1e-3; red>=1e-1"
+                    )
+                else:
+                    self.status_text.text = (
+                        "Vertex gather confidence before topology solve: "
+                        "magenta=0; red=0.25; yellow=0.5; "
+                        "green=0.75; blue=1"
                     )
             return
         self.accumulator.execute(
@@ -431,6 +562,13 @@ class SurfaceProbePathTracingRenderer:
                 f"vertex anchors: "
                 f"{self.layout.total_vertex_anchor_site_count:,}; "
                 f"probes: {self.layout.total_probe_count:,}"
+                "; probe cache: indirect + sky, sun direct: realtime"
+                + (
+                    f"; vertex lighting: RGBM, "
+                    f"{self.vertex_lighting.last_pass_count} passes"
+                    if self.vertex_lighting.built
+                    else "; vertex lighting: not built"
+                )
             )
 
     def setup_ui(
@@ -450,11 +588,42 @@ class SurfaceProbePathTracingRenderer:
                 "Vertex Fallback",
                 value=self.vertex_fallback,
             )
+        self.use_vertex_lighting_check_box = spy.ui.CheckBox(
+            ui_window,
+            "Use Vertex Lighting",
+            value=self.use_vertex_lighting,
+        )
         self.debug_view_combo = spy.ui.ComboBox(
             ui_window,
             "Debug View",
             items=list(SURFACE_PROBE_DEBUG_VIEWS),
             value=self.debug_view,
+        )
+        self.vertex_lighting_passes_slider = spy.ui.SliderInt(
+            ui_window,
+            "Vertex Smooth Passes",
+            min=0,
+            max=128,
+            value=64,
+        )
+        self.vertex_lighting_strength_slider = spy.ui.SliderFloat(
+            ui_window,
+            "Vertex Smooth Strength",
+            min=0.0,
+            max=8.0,
+            value=1.0,
+        )
+        self.vertex_lighting_rgbm_range_slider = spy.ui.SliderFloat(
+            ui_window,
+            "Vertex RGBM Range",
+            min=1.0,
+            max=128.0,
+            value=32.0,
+        )
+        self.build_vertex_lighting_button = spy.ui.Button(
+            ui_window,
+            "Build Vertex Lighting",
+            callback=self._request_vertex_lighting_build,
         )
         spy.ui.Button(
             ui_window,

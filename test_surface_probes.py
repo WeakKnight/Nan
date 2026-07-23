@@ -42,6 +42,8 @@ class SurfaceProbeRendererConfigurationTests(unittest.TestCase):
                 "Density m(x)",
                 "Vertex Fallback Weight",
                 "Probe Self-hit Rate",
+                "Vertex Lighting",
+                "Vertex Confidence",
             ),
         )
 

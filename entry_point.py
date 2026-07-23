@@ -205,8 +205,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--surface-probe-debug-view",
         choices=(
-            "beauty", "count", "support", "density", "vertex-fallback",
-            "probe-self-hit"
+              "beauty", "count", "support", "density", "vertex-fallback",
+              "probe-self-hit", "vertex-lighting", "vertex-confidence"
         ),
         default="beauty",
         help="Initial surface-probe resolve/debug visualization.",
@@ -231,6 +231,32 @@ def parse_args() -> argparse.Namespace:
         "--surface-probe-profile-build",
         action="store_true",
         help="Print sampled startup timings for surface-probe construction and GPU setup.",
+    )
+    parser.add_argument(
+        "--surface-probe-build-vertex-lighting",
+        action="store_true",
+        help="Build and preview RGBM vertex lighting on the first rendered frame.",
+    )
+    parser.add_argument(
+        "--surface-probe-vertex-lighting-build-iteration",
+        type=int,
+        default=0,
+        help=(
+            "Delay an automatic vertex-lighting build until this many probe "
+            "iterations have accumulated; interactive button builds remain immediate."
+        ),
+    )
+    parser.add_argument(
+        "--surface-probe-vertex-lighting-smooth-passes",
+        type=int,
+        default=64,
+        help="Topology diffusion passes used by automatic vertex-lighting builds.",
+    )
+    parser.add_argument(
+        "--surface-probe-vertex-lighting-smooth-strength",
+        type=float,
+        default=1.0,
+        help="Screened topology regularization strength for automatic vertex-lighting builds.",
     )
     parser.add_argument(
         "--texture-space-texels-per-unit",
@@ -3458,10 +3484,27 @@ def main() -> None:
                 "density": 3,
                 "vertex-fallback": 4,
                 "probe-self-hit": 5,
+                "vertex-lighting": 6,
+                "vertex-confidence": 7,
             }[str(args.surface_probe_debug_view)],
             show_gather_count=bool(args.surface_probe_show_gather_count),
             use_screen_accumulation=bool(args.surface_probe_screen_accum),
             sampler_backend=str(args.surface_probe_sampler_backend),
+            build_vertex_lighting=bool(
+                args.surface_probe_build_vertex_lighting
+            ),
+            vertex_lighting_build_iteration=max(
+                0,
+                int(args.surface_probe_vertex_lighting_build_iteration),
+            ),
+            vertex_lighting_smoothing_passes=max(
+                0,
+                int(args.surface_probe_vertex_lighting_smooth_passes),
+            ),
+            vertex_lighting_smoothing_strength=max(
+                0.0,
+                float(args.surface_probe_vertex_lighting_smooth_strength),
+            ),
         )
     else:
         renderer = PathTracingRenderer()

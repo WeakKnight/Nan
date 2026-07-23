@@ -5,6 +5,7 @@ import slangpy as spy
 from scene import Scene
 from surface_probe_path_tracer import SurfaceProbePathTracer
 from surface_probes import SurfaceProbeLayout
+from surface_probe_vertex_lighting import SurfaceProbeVertexLighting
 
 
 class SurfaceProbeResolve:
@@ -45,6 +46,10 @@ class SurfaceProbeResolve:
         debug_view: int = 0,
         min_gather_count: int = 4,
         use_vertex_fallback: bool = False,
+        vertex_lighting: SurfaceProbeVertexLighting | None = None,
+        vertex_lighting_rgbm: spy.Buffer | None = None,
+        vertex_lighting_target: spy.Buffer | None = None,
+        use_vertex_lighting: bool = False,
     ) -> None:
         with command_encoder.begin_compute_pass() as pass_encoder:
             shader_object = pass_encoder.bind_pipeline(self.pipeline)
@@ -58,7 +63,23 @@ class SurfaceProbeResolve:
             cursor.g_triangle_vertex_probes = (
                 self.path_tracer.triangle_vertex_probe_buffer
             )
-            cursor.g_debug_view = max(0, min(5, int(debug_view)))
+            if (
+                vertex_lighting is None
+                or vertex_lighting_rgbm is None
+                or vertex_lighting_target is None
+            ):
+                raise ValueError(
+                    "SurfaceProbeResolve requires vertex-lighting resources"
+                )
+            cursor.g_vertex_lighting_rgbm = vertex_lighting_rgbm
+            cursor.g_vertex_lighting_target = vertex_lighting_target
+            cursor.g_vertex_lighting_triangle_map = (
+                vertex_lighting.triangle_map_buffer
+            )
+            cursor.g_vertex_lighting_instance_offsets = (
+                vertex_lighting.instance_offsets_buffer
+            )
+            cursor.g_debug_view = max(0, min(7, int(debug_view)))
             cursor.g_max_density_multiplier = float(
                 self.layout.max_density_multiplier
             )
@@ -66,5 +87,10 @@ class SurfaceProbeResolve:
                 1, min(32, int(min_gather_count))
             )
             cursor.g_use_vertex_fallback = int(bool(use_vertex_fallback))
+            cursor.g_use_vertex_lighting = int(bool(use_vertex_lighting))
+            cursor.g_vertex_lighting_built = int(vertex_lighting.built)
+            cursor.g_vertex_lighting_rgbm_range = max(
+                vertex_lighting.last_rgbm_range, 1.0
+            )
             self.scene.bind(cursor.g_scene)
             pass_encoder.dispatch(thread_count=[output.width, output.height, 1])
