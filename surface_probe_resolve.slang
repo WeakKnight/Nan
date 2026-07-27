@@ -5,6 +5,7 @@ import surface_probes;
 RWTexture2D<float4> g_output;
 ByteAddressBuffer g_probe_irradiance;
 ByteAddressBuffer g_probe_self_hit_counters;
+ByteAddressBuffer g_probe_radial_moments;
 StructuredBuffer<SurfaceProbe> g_surface_probes;
 StructuredBuffer<uint4> g_surface_probe_nodes;
 StructuredBuffer<SurfaceProbeInstanceInfo> g_surface_probe_instances;
@@ -20,6 +21,7 @@ uniform uint g_use_vertex_fallback;
 uniform uint g_use_vertex_lighting;
 uniform uint g_vertex_lighting_built;
 uniform float g_vertex_lighting_rgbm_range;
+uniform uint g_use_radial_visibility;
 
 float3 gather_count_debug_color(uint count)
 {
@@ -147,7 +149,16 @@ float3 surface_probe_sample_irradiance(
         gathered_indices,
         gathered_weights);
 
-    if (gathered_count < clamp(g_min_gather_count, 1u, 32u))
+    uint minimum_count = clamp(g_min_gather_count, 1u, 32u);
+    float primary_ess = surface_probe_weight_ess(
+        gathered_count, gathered_weights);
+    float fallback_strength = smoothstep(
+        0.0,
+        1.0,
+        saturate(
+            (float(minimum_count) - primary_ess)
+            / float(minimum_count)));
+    if (fallback_strength > 1e-4)
     {
         uint fallback_count;
         uint fallback_indices[SURFACE_PROBE_MAX_GATHER];
@@ -169,10 +180,23 @@ float3 surface_probe_sample_irradiance(
             fallback_count,
             fallback_indices,
             fallback_weights);
+        for (uint fallback = 0u; fallback < fallback_count; fallback++)
+        {
+            fallback_weights[fallback] *=
+                surface_probe_fallback_visibility(
+                    g_probe_radial_moments,
+                    g_probe_irradiance,
+                    g_surface_probes,
+                    fallback_indices[fallback],
+                    query_position,
+                    instance_info.params.x,
+                    g_use_radial_visibility);
+        }
         surface_probe_merge_fallback(
             fallback_count,
             fallback_indices,
             fallback_weights,
+            0.25 * fallback_strength,
             gathered_count,
             gathered_indices,
             gathered_weights);

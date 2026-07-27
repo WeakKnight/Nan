@@ -25,6 +25,7 @@ from surface_probe_sampler import (
 )
 from surface_probe_path_tracing_renderer import (
     SURFACE_PROBE_DEBUG_VIEWS,
+    SURFACE_PROBE_RADIAL_MOMENT_SIZE,
     SURFACE_PROBE_SELF_HIT_SIZE,
     SurfaceProbePathTracingRenderer,
 )
@@ -33,6 +34,7 @@ from surface_probe_path_tracing_renderer import (
 class SurfaceProbeRendererConfigurationTests(unittest.TestCase):
     def test_only_active_debug_resources_are_allocated(self):
         self.assertEqual(SURFACE_PROBE_SELF_HIT_SIZE, 4)
+        self.assertEqual(SURFACE_PROBE_RADIAL_MOMENT_SIZE, 32)
         self.assertEqual(
             SURFACE_PROBE_DEBUG_VIEWS,
             (
@@ -563,6 +565,53 @@ class SurfaceDeficitRepairTests(unittest.TestCase):
         )
         self.assertEqual(result.selected_candidate_indices.tolist(), [0])
         self.assertEqual(int(result.counts_after[0]), 1)
+
+    def test_soft_normal_gate_keeps_sixty_degrees_and_rejects_eighty_five(self):
+        angles = np.deg2rad(np.array([60.0, 85.0], dtype=np.float32))
+        probe_normals = np.stack(
+            (
+                np.sin(angles),
+                np.cos(angles),
+                np.zeros_like(angles),
+            ),
+            axis=1,
+        ).astype(np.float32)
+        base_positions = np.array(
+            [[0.05, 0.0, 0.0], [-0.05, 0.0, 0.0]], dtype=np.float32
+        )
+        empty_positions = np.zeros((0, 3), dtype=np.float32)
+        empty_instances = np.zeros((0,), dtype=np.uint32)
+        inputs = (
+            base_positions,
+            probe_normals,
+            np.zeros((2,), dtype=np.uint32),
+            empty_positions,
+            empty_positions,
+            empty_instances,
+            np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+            np.array([[0.0, 1.0, 0.0]], dtype=np.float32),
+            np.zeros((1,), dtype=np.uint32),
+            np.array([0.5], dtype=np.float32),
+        )
+        python = deficit_repair_python(
+            *inputs,
+            min_gather_count=1,
+            max_repair_count=0,
+            normal_cosine_threshold=float(np.cos(np.deg2rad(45.0))),
+        )
+        cpp = deficit_repair_cpp(
+            *inputs,
+            min_gather_count=1,
+            max_repair_count=0,
+            normal_cosine_threshold=float(np.cos(np.deg2rad(45.0))),
+        )
+        self.assertEqual(int(python.counts_before[0]), 1)
+        np.testing.assert_array_equal(cpp.counts_before, python.counts_before)
+        np.testing.assert_allclose(
+            cpp.weight_sums_before,
+            python.weight_sums_before,
+            rtol=1e-5,
+        )
 
 
 class SurfaceCandidateFilterTests(unittest.TestCase):

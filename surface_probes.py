@@ -22,6 +22,7 @@ SURFACE_PROBE_INSTANCE_SIZE = 48
 SURFACE_PROBE_FLAG_BACK_SIDE = 1 << 0
 SURFACE_PROBE_FLAG_VERTEX_ANCHOR = 1 << 1
 SURFACE_PROBE_FLAG_PROTECTED = 1 << 2
+SURFACE_PROBE_HARD_NORMAL_COSINE = math.cos(math.radians(80.0))
 
 SurfaceProbeSamplerBackend = Literal["auto", "cpp", "python"]
 _cpp_sampler_fallback_warning_printed = False
@@ -1645,10 +1646,44 @@ class SurfaceProbeLayout:
                 time.perf_counter() - substage_start
             )
             substage_start = time.perf_counter()
+            # Audit against consumers that are independent of WSE's proposal
+            # population.  Render vertices catch topology-bound destinations;
+            # the second deterministic surface sequence approximates
+            # multi-view primary-hit queries without coupling layout startup
+            # to a synchronous GPU readback.
+            consumer_surface = _sample_instance_surface(
+                triangles,
+                triangle_indices,
+                target_count,
+                int(seed) + instance_index * 1_000_003 + 7919,
+            )
+            (
+                consumer_vertices,
+                consumer_vertex_triangle_map,
+            ) = _instance_vertex_anchors(
+                scene_node,
+                instance_index,
+                triangle_indices,
+                mesh_triangle_indices,
+                prepass.surface_area,
+            )
             audit_source = _combine_candidate_sets(
-                [boundary, inset_corners, base_candidates]
+                [
+                    boundary,
+                    inset_corners,
+                    base_candidates,
+                    consumer_surface,
+                    consumer_vertices,
+                ]
                 if adaptive_wse
-                else [boundary, inset_corners, centroids, base_candidates],
+                else [
+                    boundary,
+                    inset_corners,
+                    centroids,
+                    base_candidates,
+                    consumer_surface,
+                    consumer_vertices,
+                ],
                 base_candidates.surface_area,
             )
             candidate_profile_seconds["audit_combine"] += (
@@ -1753,15 +1788,8 @@ class SurfaceProbeLayout:
                 )
             _, material_id, _ = scene_node.instances[instance_index]
             if build_vertex_anchors:
-                vertex_anchors, triangle_vertex_anchor_indices = (
-                    _instance_vertex_anchors(
-                        scene_node,
-                        instance_index,
-                        triangle_indices,
-                        mesh_triangle_indices,
-                        prepass.surface_area,
-                    )
-                )
+                vertex_anchors = consumer_vertices
+                triangle_vertex_anchor_indices = consumer_vertex_triangle_map
             else:
                 vertex_anchors = _combine_candidate_sets(
                     [], prepass.surface_area
@@ -2657,7 +2685,7 @@ class SurfaceProbeLayout:
                         ].astype(np.float64)
                         if (
                             float(np.dot(query_normal, probe_normal))
-                            < info.normal_cosine_threshold
+                            < SURFACE_PROBE_HARD_NORMAL_COSINE
                         ):
                             continue
                     result.append(probe_index)

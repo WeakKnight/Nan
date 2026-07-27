@@ -17,6 +17,10 @@ SURFACE_PROBE_SELF_HIT_BUFFER_KEY = (
     "surface_probe_renderer.probe_self_hit_counters"
 )
 SURFACE_PROBE_SELF_HIT_SIZE = 4
+SURFACE_PROBE_RADIAL_MOMENT_BUFFER_KEY = (
+    "surface_probe_renderer.probe_radial_moments"
+)
+SURFACE_PROBE_RADIAL_MOMENT_SIZE = 32
 SURFACE_PROBE_DEBUG_VIEWS = (
     "Beauty",
     "Gather Count",
@@ -55,6 +59,7 @@ class SurfaceProbePathTracingRenderer:
         vertex_lighting_build_iteration: int = 0,
         vertex_lighting_smoothing_passes: int = 64,
         vertex_lighting_smoothing_strength: float = 1.0,
+        radial_visibility: bool = True,
     ):
         self.target_probe_count = max(1, int(target_probe_count))
         self.oversample_factor = max(1, int(oversample_factor))
@@ -87,6 +92,7 @@ class SurfaceProbePathTracingRenderer:
         self.vertex_lighting_smoothing_strength = max(
             0.0, float(vertex_lighting_smoothing_strength)
         )
+        self.radial_visibility = bool(radial_visibility)
 
         self.reset_accumulator = True
         self.reset_probes = True
@@ -99,12 +105,14 @@ class SurfaceProbePathTracingRenderer:
         self.vertex_lighting_strength_slider: spy.ui.SliderFloat | None = None
         self.vertex_lighting_rgbm_range_slider: spy.ui.SliderFloat | None = None
         self.build_vertex_lighting_button: spy.ui.Button | None = None
+        self.radial_visibility_check_box: spy.ui.CheckBox | None = None
         self.debug_view_combo: spy.ui.ComboBox | None = None
         self.status_text: spy.ui.Text | None = None
         self._output_size: tuple[int, int] | None = None
         self._previous_debug_view = self.debug_view
         self._previous_vertex_fallback = self.vertex_fallback
         self._previous_use_vertex_lighting = self.use_vertex_lighting
+        self._previous_radial_visibility = self.radial_visibility
         self._build_vertex_lighting_requested = bool(build_vertex_lighting)
 
     def initialize(self, device: spy.Device, scene: Scene) -> None:
@@ -235,6 +243,7 @@ class SurfaceProbePathTracingRenderer:
             f"adaptive_wse={self.layout.adaptive_wse}; "
             f"{self.layout.total_probe_count * SURFACE_PROBE_PAYLOAD_SIZE / (1024 * 1024):.2f} MiB irradiance; "
             f"{self.layout.total_probe_count * SURFACE_PROBE_SELF_HIT_SIZE / (1024 * 1024):.2f} MiB self-hit counters; "
+            f"{self.layout.total_probe_count * SURFACE_PROBE_RADIAL_MOMENT_SIZE / (1024 * 1024):.2f} MiB radial moments; "
             f"{self.layout.probes.nbytes / (1024 * 1024):.2f} MiB metadata)"
         )
         for index, info in enumerate(self.layout.instance_infos):
@@ -349,6 +358,13 @@ class SurfaceProbePathTracingRenderer:
         )
         return requested and self.vertex_lighting.built
 
+    def _use_radial_visibility(self) -> bool:
+        return (
+            self.radial_visibility
+            if self.radial_visibility_check_box is None
+            else bool(self.radial_visibility_check_box.value)
+        )
+
     def _request_vertex_lighting_build(self) -> None:
         self._build_vertex_lighting_requested = True
         self.reset_accumulator = True
@@ -391,6 +407,13 @@ class SurfaceProbePathTracingRenderer:
             self.reset_accumulator = True
             self._previous_use_vertex_lighting = use_vertex_lighting
 
+        use_radial_visibility = self._use_radial_visibility()
+        if use_radial_visibility != self._previous_radial_visibility:
+            self.reset_accumulator = True
+            if self.vertex_lighting.built:
+                self._build_vertex_lighting_requested = True
+            self._previous_radial_visibility = use_radial_visibility
+
         probe_irradiance = render_data.get_buffer(
             SURFACE_PROBE_BUFFER_KEY,
             usage=spy.BufferUsage.unordered_access
@@ -407,6 +430,14 @@ class SurfaceProbePathTracingRenderer:
             element_count=self.layout.total_probe_count,
             label="surface_probe_self_hit_counters",
         )
+        probe_radial_moments = render_data.get_buffer(
+            SURFACE_PROBE_RADIAL_MOMENT_BUFFER_KEY,
+            usage=spy.BufferUsage.unordered_access
+            | spy.BufferUsage.shader_resource,
+            struct_size=SURFACE_PROBE_RADIAL_MOMENT_SIZE,
+            element_count=self.layout.total_probe_count,
+            label="surface_probe_radial_moments",
+        )
 
         if not self._is_paused() or self.reset_probes:
             resetting = self.reset_probes
@@ -414,6 +445,7 @@ class SurfaceProbePathTracingRenderer:
                 command_encoder,
                 probe_irradiance,
                 probe_self_hit_counters,
+                probe_radial_moments,
                 self.probe_iteration,
                 reset=resetting,
             )
@@ -447,10 +479,12 @@ class SurfaceProbePathTracingRenderer:
                 command_encoder,
                 render_data,
                 probe_irradiance,
+                probe_radial_moments,
                 min_gather_count=self.repair_min_gather,
                 smoothing_passes=smoothing_passes,
                 regularization_strength=regularization_strength,
                 rgbm_range=rgbm_range,
+                use_radial_visibility=use_radial_visibility,
             )
             self._build_vertex_lighting_requested = False
             self.reset_accumulator = True
@@ -494,6 +528,7 @@ class SurfaceProbePathTracingRenderer:
             command_encoder,
             probe_irradiance,
             probe_self_hit_counters,
+            probe_radial_moments,
             resolve_texture,
             debug_view=debug_view,
             min_gather_count=self.repair_min_gather,
@@ -502,6 +537,7 @@ class SurfaceProbePathTracingRenderer:
             vertex_lighting_rgbm=vertex_lighting_rgbm,
             vertex_lighting_target=vertex_lighting_target,
             use_vertex_lighting=use_vertex_lighting,
+            use_radial_visibility=use_radial_visibility,
         )
         if debug_view not in (0, 6):
             command_encoder.blit(output, resolve_texture)
@@ -581,6 +617,11 @@ class SurfaceProbePathTracingRenderer:
         )
         self.pause_check_box = spy.ui.CheckBox(
             ui_window, "Pause Probe Tracing", value=False
+        )
+        self.radial_visibility_check_box = spy.ui.CheckBox(
+            ui_window,
+            "Fallback Radial Visibility",
+            value=self.radial_visibility,
         )
         if self.layout.total_vertex_anchor_probe_count > 0:
             self.vertex_fallback_check_box = spy.ui.CheckBox(

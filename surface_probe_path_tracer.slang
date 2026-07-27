@@ -4,6 +4,7 @@ import surface_probes;
 
 RWByteAddressBuffer g_probe_irradiance;
 RWByteAddressBuffer g_probe_self_hit_counters;
+RWByteAddressBuffer g_probe_radial_moments;
 StructuredBuffer<SurfaceProbe> g_surface_probes;
 StructuredBuffer<SurfaceProbeInstanceInfo> g_surface_probe_instances;
 StructuredBuffer<uint4> g_triangle_vertex_probes;
@@ -25,6 +26,8 @@ struct SurfaceProbePath
     uint source_primitive_index;
     float source_origin_offset;
     uint self_hit_suspect_count;
+    float first_hit_distance;
+    float radial_max_distance;
 };
 
 float3 load_cached_irradiance(uint probe_index)
@@ -70,6 +73,55 @@ void store_accumulated_self_hit_count(
         previous_count + local_self_hit_count);
 }
 
+void clear_radial_moments(uint probe_index)
+{
+    for (uint sector = 0u;
+         sector < SURFACE_PROBE_RADIAL_SECTOR_COUNT;
+         sector++)
+    {
+        surface_probe_store_radial_moments(
+            g_probe_radial_moments,
+            probe_index,
+            sector,
+            float2(0.0));
+    }
+}
+
+void accumulate_radial_moment(
+    uint probe_index,
+    uint sector,
+    float normalized_distance,
+    uint previous_iteration_count,
+    uint local_sector_sample_count)
+{
+    float2 previous = surface_probe_load_radial_moments(
+        g_probe_radial_moments, probe_index, sector);
+    float sample = clamp(normalized_distance, 0.0, 2.0);
+    float2 sample_moments = float2(sample, sample * sample);
+    if (previous.y <= 0.0)
+    {
+        previous = sample_moments;
+    }
+    else
+    {
+        // RG16F intentionally carries no count.  The expected per-sector
+        // population gives a stable streaming mean while keeping the payload
+        // at exactly four bytes per sector.
+        uint expected_previous = max(
+            previous_iteration_count * max(g_samples_per_probe, 1u)
+                / SURFACE_PROBE_RADIAL_SECTOR_COUNT,
+            1u);
+        float alpha = 1.0 / float(
+            min(expected_previous + local_sector_sample_count, 4096u));
+        previous = lerp(previous, sample_moments, alpha);
+    }
+    surface_probe_store_radial_moments(
+        g_probe_radial_moments,
+        probe_index,
+        sector,
+        clamp(previous, 0.0, 4.0));
+}
+
 void trace_radiance(inout SurfaceProbePath path)
 {
     uint bounce = 0;
@@ -79,8 +131,15 @@ void trace_radiance(inout SurfaceProbePath path)
         HitInfo hit = g_scene.intersect(path.ray, hit_distance);
         if (!hit.valid)
         {
+            if (bounce == 0u)
+                path.first_hit_distance = path.radial_max_distance;
             path.radiance += path.throughput * g_scene.sample_sky_lut(path.ray.dir);
             return;
+        }
+        if (bounce == 0u)
+        {
+            path.first_hit_distance = min(
+                hit_distance, path.radial_max_distance);
         }
 
         bool same_primitive =
@@ -122,6 +181,8 @@ float3 estimate_surface_irradiance(
     HitInfo surface_hit,
     float3 view_direction,
     uint local_sample_count,
+    uint probe_index,
+    float kernel_radius,
     inout RNG rng,
     out uint self_hit_suspect_count)
 {
@@ -129,6 +190,12 @@ float3 estimate_surface_irradiance(
         g_scene.get_shading_data(surface_hit, view_direction);
     float3 irradiance_sample = float3(0.0);
     self_hit_suspect_count = 0u;
+    uint previous_iteration_count =
+        g_reset != 0 ? 0u : load_cached_sample_count(probe_index);
+    uint local_sector_counts[SURFACE_PROBE_RADIAL_SECTOR_COUNT] =
+        { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+    if (g_reset != 0)
+        clear_radial_moments(probe_index);
     for (uint sample_index = 0; sample_index < local_sample_count; sample_index++)
     {
         // The probe cache is indirect-only. Sun light on the probe's own
@@ -156,9 +223,23 @@ float3 estimate_surface_irradiance(
             path.source_origin_offset = length(
                 initial_origin - surface.position);
             path.self_hit_suspect_count = 0u;
+            path.first_hit_distance = 2.0 * kernel_radius;
+            path.radial_max_distance = 2.0 * kernel_radius;
             trace_radiance(path);
             rng = path.rng;
             self_hit_suspect_count += path.self_hit_suspect_count;
+            float azimuth = atan2(direction_sample.y, direction_sample.x);
+            uint sector = min(
+                uint((azimuth / TWO_PI + 0.5)
+                    * float(SURFACE_PROBE_RADIAL_SECTOR_COUNT)),
+                SURFACE_PROBE_RADIAL_SECTOR_COUNT - 1u);
+            local_sector_counts[sector] += 1u;
+            accumulate_radial_moment(
+                probe_index,
+                sector,
+                path.first_hit_distance / max(kernel_radius, 1e-6),
+                previous_iteration_count,
+                local_sector_counts[sector]);
             sample_irradiance +=
                 path.radiance * abs(direction_sample.z) / direction_sample.w;
         }
@@ -195,6 +276,8 @@ void compute_main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         surface_hit,
         view_direction,
         max(g_samples_per_probe, 1u),
+        probe_index,
+        max(instance_info.params.x, 1e-6),
         rng,
         self_hit_suspect_count);
     store_accumulated_irradiance(probe_index, irradiance);

@@ -50,6 +50,7 @@ class SurfaceProbePathTracer:
         command_encoder: spy.CommandEncoder,
         output: spy.Buffer,
         self_hit_counters: spy.Buffer,
+        radial_moments: spy.Buffer,
         iteration: int,
         *,
         reset: bool = False,
@@ -64,6 +65,7 @@ class SurfaceProbePathTracer:
                 cursor = spy.ShaderCursor(shader_object)
                 cursor.g_probe_irradiance = output
                 cursor.g_probe_self_hit_counters = self_hit_counters
+                cursor.g_probe_radial_moments = radial_moments
                 cursor.g_surface_probes = self.probe_buffer
                 cursor.g_surface_probe_instances = self.instance_buffer
                 cursor.g_triangle_vertex_probes = (

@@ -12,6 +12,22 @@ import numpy as np
 import numpy.typing as npt
 
 
+SURFACE_PROBE_HARD_NORMAL_COSINE = float(
+    np.cos(np.deg2rad(np.float64(80.0)))
+)
+
+
+def _soft_normal_weights(
+    normal_cosine: np.ndarray,
+    full_confidence_cosine: float,
+) -> np.ndarray:
+    edge0 = SURFACE_PROBE_HARD_NORMAL_COSINE
+    edge1 = max(float(full_confidence_cosine), edge0 + 1e-3)
+    t = np.clip((normal_cosine - edge0) / (edge1 - edge0), 0.0, 1.0)
+    gate = t * t * (3.0 - 2.0 * t)
+    return gate * np.maximum(normal_cosine, 0.0)
+
+
 PROJECT_DIR = Path(__file__).resolve().parent
 BUILD_DIR = PROJECT_DIR / "surface_probe_sampler_build"
 
@@ -947,7 +963,7 @@ def _gather_weights_reference(
     distance_squared = np.einsum("ij,ij->i", delta, delta)
     normal_cosine = normals @ query_normal
     valid = (distance_squared <= radius * radius) & (
-        normal_cosine >= normal_cosine_threshold
+        normal_cosine >= SURFACE_PROBE_HARD_NORMAL_COSINE
     )
     if not np.any(valid):
         return np.zeros((0,), dtype=np.float32)
@@ -958,7 +974,12 @@ def _gather_weights_reference(
     plane_distance = np.abs(delta @ query_normal)
     plane_weight = np.exp(-0.5 * np.square(plane_distance / plane_sigma))
     spatial = np.maximum(1.0 - distance_squared / (radius * radius), 0.0)
-    weights = spatial * spatial * plane_weight * np.maximum(normal_cosine, 0.0)
+    weights = (
+        spatial
+        * spatial
+        * plane_weight
+        * _soft_normal_weights(normal_cosine, normal_cosine_threshold)
+    )
     positive = weights > weight_epsilon
     weights = weights[positive]
     order = np.argsort(-weights, kind="stable")[:96]
@@ -1210,7 +1231,7 @@ def estimate_support_python(
         distance_squared = np.einsum("ij,ij->i", delta, delta)
         normal_cosine = normals @ query_n[query]
         valid = (distance_squared <= radius * radius) & (
-            normal_cosine >= normal_cosine_threshold
+            normal_cosine >= SURFACE_PROBE_HARD_NORMAL_COSINE
         )
         if np.any(valid):
             local_delta = delta[valid]
@@ -1222,7 +1243,12 @@ def estimate_support_python(
                 * np.square((local_delta @ query_n[query]) / plane_sigma)
             )
             spatial = np.maximum(1.0 - d2 / (radius * radius), 0.0)
-            kernel = spatial * spatial * plane * np.maximum(cosine, 0.0)
+            kernel = (
+                spatial
+                * spatial
+                * plane
+                * _soft_normal_weights(cosine, normal_cosine_threshold)
+            )
             kernel = np.where(kernel > weight_epsilon, kernel, 0.0)
             support = float(
                 np.sum(kernel * local_area_weights[valid], dtype=np.float64)

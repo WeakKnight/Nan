@@ -2,6 +2,7 @@ import common;
 import surface_probes;
 
 ByteAddressBuffer g_probe_irradiance;
+ByteAddressBuffer g_probe_radial_moments;
 StructuredBuffer<SurfaceProbe> g_surface_probes;
 StructuredBuffer<uint4> g_surface_probe_nodes;
 StructuredBuffer<SurfaceProbeInstanceInfo> g_surface_probe_instances;
@@ -26,6 +27,7 @@ RWStructuredBuffer<uint> g_packed_rgbm;
 
 uniform uint g_vertex_count;
 uniform uint g_min_gather_count;
+uniform uint g_use_radial_visibility;
 uniform float g_regularization_strength;
 uniform float g_rgbm_range;
 
@@ -64,7 +66,15 @@ float3 vertex_lighting_spatial_gather(
         gathered_weights);
 
     uint minimum_count = clamp(g_min_gather_count, 1u, 32u);
-    if (gathered_count < minimum_count)
+    float primary_ess = surface_probe_weight_ess(
+        gathered_count, gathered_weights);
+    float fallback_strength = smoothstep(
+        0.0,
+        1.0,
+        saturate(
+            (float(minimum_count) - primary_ess)
+            / float(minimum_count)));
+    if (fallback_strength > 1e-4)
     {
         uint fallback_count;
         uint fallback_indices[SURFACE_PROBE_MAX_GATHER];
@@ -86,10 +96,23 @@ float3 vertex_lighting_spatial_gather(
             fallback_count,
             fallback_indices,
             fallback_weights);
+        for (uint fallback = 0u; fallback < fallback_count; fallback++)
+        {
+            fallback_weights[fallback] *=
+                surface_probe_fallback_visibility(
+                    g_probe_radial_moments,
+                    g_probe_irradiance,
+                    g_surface_probes,
+                    fallback_indices[fallback],
+                    query_position,
+                    instance_info.params.x,
+                    g_use_radial_visibility);
+        }
         surface_probe_merge_fallback(
             fallback_count,
             fallback_indices,
             fallback_weights,
+            0.25 * fallback_strength,
             gathered_count,
             gathered_indices,
             gathered_weights);

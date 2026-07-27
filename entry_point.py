@@ -167,7 +167,18 @@ def parse_args() -> argparse.Namespace:
         "--surface-probe-normal-angle",
         type=float,
         default=45.0,
-        help="Normal compatibility threshold in degrees for surface probe gather.",
+        help=(
+            "Angle where surface-probe normal compatibility reaches full "
+            "confidence; support fades softly to a hard reject at 80 degrees."
+        ),
+    )
+    parser.add_argument(
+        "--surface-probe-no-radial-visibility",
+        action="store_true",
+        help=(
+            "Disable the 8-sector RG16F radial-moment visibility prior used "
+            "only by the 2R fallback tier."
+        ),
     )
     parser.add_argument(
         "--surface-probe-repair-budget-ratio",
@@ -3504,6 +3515,9 @@ def main() -> None:
             vertex_lighting_smoothing_strength=max(
                 0.0,
                 float(args.surface_probe_vertex_lighting_smooth_strength),
+            ),
+            radial_visibility=not bool(
+                args.surface_probe_no_radial_visibility
             ),
         )
     else:

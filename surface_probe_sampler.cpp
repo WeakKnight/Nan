@@ -25,7 +25,7 @@
 namespace
 {
 constexpr const char* kVersion =
-    "cyCodeBase/62da186e0b2f2d3673d1f18386c66caf5798cd9b+parallel-adaptive-v3+parallel-repair-v2+parallel-filter-v1+parallel-octree-v1";
+    "cyCodeBase/62da186e0b2f2d3673d1f18386c66caf5798cd9b+parallel-adaptive-v3+soft-gather-v1+parallel-repair-v2+parallel-filter-v1+parallel-octree-v1";
 
 std::uint32_t parallel_worker_count(std::uint32_t count)
 {
@@ -451,6 +451,7 @@ float gather_weight(
     float normal_cosine_threshold,
     float weight_epsilon)
 {
+    constexpr float hard_normal_cosine = 0.17364818f;
     const float delta[3] = {
         probe_position[0] - query_position[0],
         probe_position[1] - query_position[1],
@@ -463,16 +464,25 @@ float gather_weight(
         return 0.0f;
     }
     const float normal_cosine = dot3(query_normal, probe_normal);
-    if (normal_cosine < normal_cosine_threshold)
+    if (normal_cosine < hard_normal_cosine)
     {
         return 0.0f;
     }
+    const float soft_end = std::max(
+        normal_cosine_threshold, hard_normal_cosine + 1.0e-3f);
+    const float normal_t = std::clamp(
+        (normal_cosine - hard_normal_cosine) /
+            (soft_end - hard_normal_cosine),
+        0.0f,
+        1.0f);
+    const float normal_gate =
+        normal_t * normal_t * (3.0f - 2.0f * normal_t);
     const float plane_sigma = std::max(radius * 0.25f, 1.0e-6f);
     const float plane_distance = std::abs(dot3(delta, query_normal));
     const float plane_ratio = plane_distance / plane_sigma;
     const float plane_weight = std::exp(-0.5f * plane_ratio * plane_ratio);
     const float spatial = std::max(1.0f - distance_squared / radius_squared, 0.0f);
-    const float weight = spatial * spatial * plane_weight *
+    const float weight = spatial * spatial * plane_weight * normal_gate *
         std::max(normal_cosine, 0.0f);
     return weight > weight_epsilon ? weight : 0.0f;
 }

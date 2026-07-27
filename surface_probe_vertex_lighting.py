@@ -790,11 +790,13 @@ class SurfaceProbeVertexLighting:
         command_encoder: spy.CommandEncoder,
         render_data: RenderData,
         probe_irradiance: spy.Buffer,
+        probe_radial_moments: spy.Buffer,
         *,
         min_gather_count: int,
         smoothing_passes: int,
         regularization_strength: float,
         rgbm_range: float,
+        use_radial_visibility: bool = True,
     ) -> spy.Buffer:
         target = self.target_buffer(render_data)
         work_a = self._buffer(
@@ -813,6 +815,7 @@ class SurfaceProbeVertexLighting:
             shader = pass_encoder.bind_pipeline(self.gather_pipeline)
             cursor = spy.ShaderCursor(shader)
             cursor.g_probe_irradiance = probe_irradiance
+            cursor.g_probe_radial_moments = probe_radial_moments
             cursor.g_surface_probes = self.path_tracer.probe_buffer
             cursor.g_surface_probe_nodes = self.path_tracer.node_buffer
             cursor.g_surface_probe_instances = (
@@ -830,6 +833,9 @@ class SurfaceProbeVertexLighting:
             cursor.g_vertex_count = count
             cursor.g_min_gather_count = max(
                 1, min(32, int(min_gather_count))
+            )
+            cursor.g_use_radial_visibility = int(
+                bool(use_radial_visibility)
             )
             pass_encoder.dispatch(thread_count=[count, 1, 1])
 

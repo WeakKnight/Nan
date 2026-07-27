@@ -41,6 +41,7 @@ class SurfaceProbeResolve:
         command_encoder: spy.CommandEncoder,
         probe_irradiance: spy.Buffer,
         probe_self_hit_counters: spy.Buffer,
+        probe_radial_moments: spy.Buffer,
         output: spy.Texture,
         *,
         debug_view: int = 0,
@@ -50,6 +51,7 @@ class SurfaceProbeResolve:
         vertex_lighting_rgbm: spy.Buffer | None = None,
         vertex_lighting_target: spy.Buffer | None = None,
         use_vertex_lighting: bool = False,
+        use_radial_visibility: bool = True,
     ) -> None:
         with command_encoder.begin_compute_pass() as pass_encoder:
             shader_object = pass_encoder.bind_pipeline(self.pipeline)
@@ -57,6 +59,7 @@ class SurfaceProbeResolve:
             cursor.g_output = output
             cursor.g_probe_irradiance = probe_irradiance
             cursor.g_probe_self_hit_counters = probe_self_hit_counters
+            cursor.g_probe_radial_moments = probe_radial_moments
             cursor.g_surface_probes = self.path_tracer.probe_buffer
             cursor.g_surface_probe_nodes = self.path_tracer.node_buffer
             cursor.g_surface_probe_instances = self.path_tracer.instance_buffer
@@ -91,6 +94,9 @@ class SurfaceProbeResolve:
             cursor.g_vertex_lighting_built = int(vertex_lighting.built)
             cursor.g_vertex_lighting_rgbm_range = max(
                 vertex_lighting.last_rgbm_range, 1.0
+            )
+            cursor.g_use_radial_visibility = int(
+                bool(use_radial_visibility)
             )
             self.scene.bind(cursor.g_scene)
             pass_encoder.dispatch(thread_count=[output.width, output.height, 1])
