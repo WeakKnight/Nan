@@ -57,6 +57,17 @@ float3 vertex_lighting_spatial_gather(
         candidate_count,
         candidate_indices,
         candidate_weights);
+    for (uint candidate = 0u; candidate < candidate_count; candidate++)
+    {
+        candidate_weights[candidate] *= surface_probe_radial_visibility(
+            g_probe_radial_moments,
+            g_probe_irradiance,
+            g_surface_probes,
+            candidate_indices[candidate],
+            query_position,
+            instance_info.params.x,
+            g_use_radial_visibility);
+    }
     surface_probe_select_strongest(
         candidate_count,
         candidate_indices,
@@ -89,6 +100,17 @@ float3 vertex_lighting_spatial_gather(
             candidate_count,
             candidate_indices,
             candidate_weights);
+        for (uint candidate = 0u; candidate < candidate_count; candidate++)
+        {
+            candidate_weights[candidate] *= surface_probe_radial_visibility(
+                g_probe_radial_moments,
+                g_probe_irradiance,
+                g_surface_probes,
+                candidate_indices[candidate],
+                query_position,
+                instance_info.params.x,
+                g_use_radial_visibility);
+        }
         surface_probe_select_strongest(
             candidate_count,
             candidate_indices,
@@ -96,18 +118,6 @@ float3 vertex_lighting_spatial_gather(
             fallback_count,
             fallback_indices,
             fallback_weights);
-        for (uint fallback = 0u; fallback < fallback_count; fallback++)
-        {
-            fallback_weights[fallback] *=
-                surface_probe_fallback_visibility(
-                    g_probe_radial_moments,
-                    g_probe_irradiance,
-                    g_surface_probes,
-                    fallback_indices[fallback],
-                    query_position,
-                    instance_info.params.x,
-                    g_use_radial_visibility);
-        }
         surface_probe_merge_fallback(
             fallback_count,
             fallback_indices,

@@ -669,21 +669,12 @@ class SurfaceProbeVertexLighting:
         scene: Scene,
         path_tracer: SurfaceProbePathTracer,
         *,
+        defer_layout: bool = False,
         profile_sink: list[tuple[str, float]] | None = None,
     ):
         self.device = device
         self.scene = scene
         self.path_tracer = path_tracer
-        start = time.perf_counter()
-        self.layout = VertexLightingLayout.build(
-            scene.scene_node,
-            probe_layout=path_tracer.layout,
-        )
-        if profile_sink is not None:
-            profile_sink.append(
-                ("vertex_lighting_layout", time.perf_counter() - start)
-            )
-
         self.gather_pipeline = device.create_compute_pipeline(
             device.load_program(
                 "surface_probe_vertex_lighting.slang", ["gather_main"]
@@ -699,22 +690,98 @@ class SurfaceProbeVertexLighting:
                 "surface_probe_vertex_lighting.slang", ["pack_main"]
             )
         )
-        self.vertex_meta_buffer = device.create_buffer(
+        self.layout: VertexLightingLayout | None = None
+        self._create_dummy_buffers()
+        if not defer_layout:
+            self.ensure_layout(profile_sink=profile_sink)
+        self.built = False
+        self.last_pass_count = 0
+        self.last_regularization = 0.0
+        self.last_rgbm_range = 0.0
+
+    def _create_dummy_buffers(self) -> None:
+        """Provide bind-valid resources until Vertex Lighting is requested."""
+
+        self.vertex_meta_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="vertex_lighting_meta_dummy",
+            data=np.zeros((1, 4), dtype=np.uint32),
+        )
+        self.vertex_position_area_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="vertex_lighting_position_area_dummy",
+            data=np.zeros((1, 4), dtype=np.float32),
+        )
+        self.vertex_normal_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="vertex_lighting_normal_dummy",
+            data=np.zeros((1, 4), dtype=np.float32),
+        )
+        self.neighbor_offsets_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="vertex_lighting_neighbor_offsets_dummy",
+            data=np.zeros((2,), dtype=np.uint32),
+        )
+        self.neighbors_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="vertex_lighting_neighbors_dummy",
+            data=np.zeros((1, 2), dtype=np.uint32),
+        )
+        self.projection_offsets_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="vertex_lighting_projection_offsets_dummy",
+            data=np.zeros((2,), dtype=np.uint32),
+        )
+        self.projection_samples_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="vertex_lighting_projection_samples_dummy",
+            data=np.zeros((1, 3), dtype=np.uint32),
+        )
+        self.triangle_map_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="vertex_lighting_triangle_map_dummy",
+            data=np.zeros((1, 4), dtype=np.uint32),
+        )
+        self.instance_offsets_buffer = self.device.create_buffer(
+            usage=spy.BufferUsage.shader_resource,
+            label="vertex_lighting_instance_offsets_dummy",
+            data=np.zeros((1, 2), dtype=np.uint32),
+        )
+
+    def ensure_layout(
+        self,
+        *,
+        profile_sink: list[tuple[str, float]] | None = None,
+    ) -> VertexLightingLayout:
+        if self.layout is not None:
+            return self.layout
+
+        start = time.perf_counter()
+        self.layout = VertexLightingLayout.build(
+            self.scene.scene_node,
+            probe_layout=self.path_tracer.layout,
+        )
+        if profile_sink is not None:
+            profile_sink.append(
+                ("vertex_lighting_layout", time.perf_counter() - start)
+            )
+
+        self.vertex_meta_buffer = self.device.create_buffer(
             usage=spy.BufferUsage.shader_resource,
             label="vertex_lighting_meta",
             data=np.ascontiguousarray(self.layout.vertex_meta),
         )
-        self.vertex_position_area_buffer = device.create_buffer(
+        self.vertex_position_area_buffer = self.device.create_buffer(
             usage=spy.BufferUsage.shader_resource,
             label="vertex_lighting_position_area",
             data=np.ascontiguousarray(self.layout.vertex_position_area),
         )
-        self.vertex_normal_buffer = device.create_buffer(
+        self.vertex_normal_buffer = self.device.create_buffer(
             usage=spy.BufferUsage.shader_resource,
             label="vertex_lighting_normal",
             data=np.ascontiguousarray(self.layout.vertex_normal),
         )
-        self.neighbor_offsets_buffer = device.create_buffer(
+        self.neighbor_offsets_buffer = self.device.create_buffer(
             usage=spy.BufferUsage.shader_resource,
             label="vertex_lighting_neighbor_offsets",
             data=np.ascontiguousarray(self.layout.neighbor_offsets),
@@ -724,12 +791,12 @@ class SurfaceProbeVertexLighting:
             if self.layout.neighbors.size
             else np.zeros((1, 2), dtype=np.uint32)
         )
-        self.neighbors_buffer = device.create_buffer(
+        self.neighbors_buffer = self.device.create_buffer(
             usage=spy.BufferUsage.shader_resource,
             label="vertex_lighting_neighbors",
             data=np.ascontiguousarray(neighbor_data),
         )
-        self.projection_offsets_buffer = device.create_buffer(
+        self.projection_offsets_buffer = self.device.create_buffer(
             usage=spy.BufferUsage.shader_resource,
             label="vertex_lighting_projection_offsets",
             data=np.ascontiguousarray(self.layout.projection_offsets),
@@ -739,25 +806,22 @@ class SurfaceProbeVertexLighting:
             if self.layout.projection_samples.size
             else np.zeros((1, 3), dtype=np.uint32)
         )
-        self.projection_samples_buffer = device.create_buffer(
+        self.projection_samples_buffer = self.device.create_buffer(
             usage=spy.BufferUsage.shader_resource,
             label="vertex_lighting_projection_samples",
             data=np.ascontiguousarray(projection_data),
         )
-        self.triangle_map_buffer = device.create_buffer(
+        self.triangle_map_buffer = self.device.create_buffer(
             usage=spy.BufferUsage.shader_resource,
             label="vertex_lighting_triangle_map",
             data=np.ascontiguousarray(self.layout.triangle_map),
         )
-        self.instance_offsets_buffer = device.create_buffer(
+        self.instance_offsets_buffer = self.device.create_buffer(
             usage=spy.BufferUsage.shader_resource,
             label="vertex_lighting_instance_offsets",
             data=np.ascontiguousarray(self.layout.instance_offsets),
         )
-        self.built = False
-        self.last_pass_count = 0
-        self.last_regularization = 0.0
-        self.last_rgbm_range = 0.0
+        return self.layout
 
     def _buffer(
         self,
@@ -766,12 +830,13 @@ class SurfaceProbeVertexLighting:
         *,
         stride: int,
     ) -> spy.Buffer:
+        vertex_count = 0 if self.layout is None else self.layout.vertex_count
         return render_data.get_buffer(
             key,
             usage=spy.BufferUsage.unordered_access
             | spy.BufferUsage.shader_resource,
             struct_size=stride,
-            element_count=max(self.layout.vertex_count, 1),
+            element_count=max(vertex_count, 1),
             label=key.rsplit(".", 1)[-1],
         )
 
@@ -798,6 +863,7 @@ class SurfaceProbeVertexLighting:
         rgbm_range: float,
         use_radial_visibility: bool = True,
     ) -> spy.Buffer:
+        layout = self.ensure_layout()
         target = self.target_buffer(render_data)
         work_a = self._buffer(
             render_data, VERTEX_LIGHTING_WORK_A_KEY, stride=16
@@ -806,7 +872,7 @@ class SurfaceProbeVertexLighting:
             render_data, VERTEX_LIGHTING_WORK_B_KEY, stride=16
         )
         packed = self.packed_buffer(render_data)
-        count = self.layout.vertex_count
+        count = layout.vertex_count
         if count == 0:
             self.built = True
             return packed

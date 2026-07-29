@@ -126,6 +126,9 @@ class CameraController:
         spy.KeyCode.s: spy.float3(0, 0, -1),
     }
     MOVE_SHIFT_FACTOR = 10.0
+    MOVE_SPEED_PERCENT_MIN = 20.0
+    MOVE_SPEED_PERCENT_MAX = 2000.0
+    MOVE_SPEED_PERCENT_DEFAULT = 100.0
 
     def __init__(self, camera: Camera):
         super().__init__()
@@ -139,9 +142,16 @@ class CameraController:
         self.rotate_delta = spy.float2()
 
         self.move_speed = 1.0
+        self.move_speed_percent = CameraController.MOVE_SPEED_PERCENT_DEFAULT
         self.rotate_speed = 0.002
 
         self.move_test = False
+
+    def set_move_speed_percent(self, value: float) -> None:
+        self.move_speed_percent = max(
+            CameraController.MOVE_SPEED_PERCENT_MIN,
+            min(CameraController.MOVE_SPEED_PERCENT_MAX, float(value)),
+        )
 
     def update(self, dt: float, frame: int):
         changed = False
@@ -162,7 +172,8 @@ class CameraController:
             offset += up * self.move_delta.y
             offset += fwd * self.move_delta.z
             factor = CameraController.MOVE_SHIFT_FACTOR if self.shift_down else 1.0
-            offset *= self.move_speed * factor * dt
+            speed_scale = self.move_speed_percent / 100.0
+            offset *= self.move_speed * speed_scale * factor * dt
             position += offset
             changed = True
 

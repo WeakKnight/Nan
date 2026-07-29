@@ -503,18 +503,105 @@ class SceneNode:
         if is_gltf:
             gltf_textures = cls._load_gltf_textures(path)
         
-        # 2. Load with Trimesh (don't use force='mesh' which merges everything and loses materials)
+        # 2. Load with Trimesh (don't use force='mesh' which merges everything and loses materials).
+        # glTF already contains render-ready normals and indices, so disabling
+        # processing avoids an expensive normal/topology rebuild for large
+        # scenes.
         try:
-            loaded = trimesh.load(path)
+            loaded = trimesh.load(path, process=not is_gltf)
             print(f"[SceneNode] Loaded type: {type(loaded).__name__}")
         except Exception as e:
             raise ValueError(f"Failed to load asset: {e}")
         
         # 3. Handle Scene vs single mesh
         if isinstance(loaded, trimesh.Scene):
-            # Use dump(concatenate=False) to get meshes with transforms baked in, but not merged
-            # This preserves individual meshes with their materials while applying scene graph transforms
-            trimesh_meshes = list(loaded.dump(concatenate=False))
+            # Keep the scene graph instanced. Scene.dump() bakes every node
+            # transform into a copied mesh; production glTF scenes commonly
+            # contain thousands of nodes referencing a few hundred unique
+            # primitives, so dumping multiplies CPU memory, normal generation,
+            # BLAS storage, and Surface Probe preprocessing by the instance
+            # count.
+            scene_node = cls()
+            scene_node.asset_path = path
+            asset_dir = os.path.dirname(os.path.abspath(path))
+
+            geometry_to_ids: dict[str, tuple[int, int]] = {}
+            referenced_geometry = {
+                loaded.graph.get(node_name)[1]
+                for node_name in loaded.graph.nodes_geometry
+            }
+            for geometry_name in sorted(referenced_geometry):
+                trimesh_mesh = loaded.geometry.get(geometry_name)
+                if trimesh_mesh is None or len(trimesh_mesh.vertices) == 0:
+                    continue
+                mesh = cls._convert_trimesh_to_mesh(
+                    trimesh_mesh, flip_uv_y=is_gltf
+                )
+                mesh_id = scene_node.add_mesh(mesh)
+                material = cls._extract_material(
+                    trimesh_mesh,
+                    asset_dir,
+                    default_material,
+                    gltf_textures,
+                )
+                material_id = scene_node.add_material(material)
+                geometry_to_ids[geometry_name] = (mesh_id, material_id)
+
+            scene_bounds = np.asarray(loaded.bounds, dtype=np.float64)
+            scene_center = scene_bounds.mean(axis=0)
+            global_transform = np.eye(4, dtype=np.float64)
+            if auto_center:
+                global_transform[:3, 3] = -scene_center
+            if scale != 1.0:
+                scale_matrix = np.diag(
+                    [float(scale), float(scale), float(scale), 1.0]
+                )
+                global_transform = scale_matrix @ global_transform
+
+            for node_name in sorted(loaded.graph.nodes_geometry):
+                node_transform, geometry_name = loaded.graph.get(node_name)
+                ids = geometry_to_ids.get(geometry_name)
+                if ids is None:
+                    continue
+                transform = Transform()
+                transform.matrix = spy.float4x4(
+                    np.asarray(
+                        global_transform @ node_transform,
+                        dtype=np.float32,
+                    )
+                )
+                transform_id = scene_node.add_transform(transform)
+                scene_node.add_instance(ids[0], ids[1], transform_id)
+
+            if not scene_node.instances:
+                raise ValueError(f"Asset contains no valid geometry: {path}")
+
+            bounds_min = scene_bounds[0] - (
+                scene_center if auto_center else 0.0
+            )
+            bounds_max = scene_bounds[1] - (
+                scene_center if auto_center else 0.0
+            )
+            bounds_min *= float(scale)
+            bounds_max *= float(scale)
+            bounds_min, bounds_max = (
+                np.minimum(bounds_min, bounds_max),
+                np.maximum(bounds_min, bounds_max),
+            )
+            center = (bounds_min + bounds_max) * 0.5
+            size = float(np.linalg.norm(bounds_max - bounds_min))
+            scene_node.camera.target = spy.float3(center.astype(np.float32))
+            scene_node.camera.position = spy.float3(
+                float(center[0]),
+                float(center[1] + size * 0.3),
+                float(center[2] + size * 1.5),
+            )
+            print(
+                "[SceneNode] Preserved instancing: "
+                f"{len(scene_node.meshes)} unique meshes, "
+                f"{len(scene_node.instances)} instances"
+            )
+            return scene_node
         elif isinstance(loaded, trimesh.Trimesh):
             trimesh_meshes = [loaded]
         else:

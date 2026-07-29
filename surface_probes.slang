@@ -16,10 +16,13 @@ struct SurfaceProbeInstanceInfo
 
 static const uint SURFACE_PROBE_PAYLOAD_STRIDE = 16;
 static const uint SURFACE_PROBE_SELF_HIT_STRIDE = 4;
-static const uint SURFACE_PROBE_RADIAL_SECTOR_COUNT = 8;
+static const uint SURFACE_PROBE_RADIAL_DEPTH_DIM = 4;
+static const uint SURFACE_PROBE_RADIAL_TEXEL_COUNT =
+    SURFACE_PROBE_RADIAL_DEPTH_DIM * SURFACE_PROBE_RADIAL_DEPTH_DIM;
 static const uint SURFACE_PROBE_RADIAL_MOMENT_STRIDE =
-    SURFACE_PROBE_RADIAL_SECTOR_COUNT * 4;
+    SURFACE_PROBE_RADIAL_TEXEL_COUNT * 4;
 static const uint SURFACE_PROBE_FLAG_BACK_SIDE = 1u << 0;
+static const uint SURFACE_PROBE_INSTANCE_SHIFT = 8;
 static const uint SURFACE_PROBE_MAX_GATHER = 32;
 static const uint SURFACE_PROBE_MAX_CANDIDATES = 96;
 // Forty-five degrees remains the full-confidence angle.  Unlike the old
@@ -53,6 +56,11 @@ float3 surface_probe_barycentrics(SurfaceProbe probe)
 bool surface_probe_is_back_side(SurfaceProbe probe)
 {
     return (probe.meta.w & SURFACE_PROBE_FLAG_BACK_SIDE) != 0;
+}
+
+uint surface_probe_instance_index(SurfaceProbe probe)
+{
+    return probe.meta.w >> SURFACE_PROBE_INSTANCE_SHIFT;
 }
 
 float surface_probe_support_f(SurfaceProbe probe)
@@ -127,32 +135,123 @@ float2 surface_probe_unpack_half2(uint packed)
 float2 surface_probe_load_radial_moments(
     ByteAddressBuffer buffer,
     uint probe_index,
-    uint sector)
+    uint texel)
 {
     uint offset = probe_index * SURFACE_PROBE_RADIAL_MOMENT_STRIDE
-        + (sector & 7u) * 4u;
+        + min(texel, SURFACE_PROBE_RADIAL_TEXEL_COUNT - 1u) * 4u;
     return surface_probe_unpack_half2(buffer.Load(offset));
 }
 
 float2 surface_probe_load_radial_moments(
     RWByteAddressBuffer buffer,
     uint probe_index,
-    uint sector)
+    uint texel)
 {
     uint offset = probe_index * SURFACE_PROBE_RADIAL_MOMENT_STRIDE
-        + (sector & 7u) * 4u;
+        + min(texel, SURFACE_PROBE_RADIAL_TEXEL_COUNT - 1u) * 4u;
     return surface_probe_unpack_half2(buffer.Load(offset));
 }
 
 void surface_probe_store_radial_moments(
     RWByteAddressBuffer buffer,
     uint probe_index,
-    uint sector,
+    uint texel,
     float2 moments)
 {
     uint offset = probe_index * SURFACE_PROBE_RADIAL_MOMENT_STRIDE
-        + (sector & 7u) * 4u;
+        + min(texel, SURFACE_PROBE_RADIAL_TEXEL_COUNT - 1u) * 4u;
     buffer.Store(offset, surface_probe_pack_half2(moments));
+}
+
+// Maps the complete +Z hemisphere to a square.  The 45-degree rotation after
+// the L1 projection turns the usual octahedral diamond into [0, 1]^2, so all
+// 16 texels represent useful directions rather than wasting the square's
+// corners.  Directions below the probe plane clamp to the horizon because the
+// cache only traces the outward hemisphere.
+float2 surface_probe_hemi_oct_encode(float3 direction)
+{
+    float3 hemisphere_direction = float3(
+        direction.xy,
+        max(direction.z, 0.0));
+    float direction_length_squared = dot(
+        hemisphere_direction,
+        hemisphere_direction);
+    if (direction_length_squared <= 1e-12)
+        return float2(0.5);
+    hemisphere_direction *= rsqrt(direction_length_squared);
+    float inverse_l1 = 1.0 / max(
+        abs(hemisphere_direction.x)
+            + abs(hemisphere_direction.y)
+            + hemisphere_direction.z,
+        1e-6);
+    float2 octahedral = hemisphere_direction.xy * inverse_l1;
+    float2 square = float2(
+        octahedral.x + octahedral.y,
+        octahedral.x - octahedral.y);
+    return saturate(square * 0.5 + 0.5);
+}
+
+uint2 surface_probe_radial_texel_coord(float2 uv)
+{
+    return min(
+        uint2(saturate(uv) * float(SURFACE_PROBE_RADIAL_DEPTH_DIM)),
+        uint2(SURFACE_PROBE_RADIAL_DEPTH_DIM - 1u));
+}
+
+uint surface_probe_radial_texel_index(uint2 coord)
+{
+    return coord.y * SURFACE_PROBE_RADIAL_DEPTH_DIM + coord.x;
+}
+
+float2 surface_probe_sample_radial_moments(
+    ByteAddressBuffer buffer,
+    uint probe_index,
+    float2 uv,
+    out float valid_weight)
+{
+    // Texture-style bilinear coordinates place texel centers at (n + 0.5)/4.
+    float2 texel_position =
+        saturate(uv) * float(SURFACE_PROBE_RADIAL_DEPTH_DIM) - 0.5;
+    int2 base_coord = int2(floor(texel_position));
+    float2 blend = frac(texel_position);
+    int maximum_coord = int(SURFACE_PROBE_RADIAL_DEPTH_DIM) - 1;
+    uint2 coord00 = uint2(clamp(base_coord, int2(0), int2(maximum_coord)));
+    uint2 coord10 = uint2(clamp(
+        base_coord + int2(1, 0), int2(0), int2(maximum_coord)));
+    uint2 coord01 = uint2(clamp(
+        base_coord + int2(0, 1), int2(0), int2(maximum_coord)));
+    uint2 coord11 = uint2(clamp(
+        base_coord + int2(1, 1), int2(0), int2(maximum_coord)));
+    float4 weights = float4(
+        (1.0 - blend.x) * (1.0 - blend.y),
+        blend.x * (1.0 - blend.y),
+        (1.0 - blend.x) * blend.y,
+        blend.x * blend.y);
+    float2 samples[4] =
+    {
+        surface_probe_load_radial_moments(
+            buffer, probe_index, surface_probe_radial_texel_index(coord00)),
+        surface_probe_load_radial_moments(
+            buffer, probe_index, surface_probe_radial_texel_index(coord10)),
+        surface_probe_load_radial_moments(
+            buffer, probe_index, surface_probe_radial_texel_index(coord01)),
+        surface_probe_load_radial_moments(
+            buffer, probe_index, surface_probe_radial_texel_index(coord11))
+    };
+
+    float2 moments = float2(0.0);
+    valid_weight = 0.0;
+    for (uint sample_index = 0u; sample_index < 4u; sample_index++)
+    {
+        if (samples[sample_index].y > 0.0)
+        {
+            moments += samples[sample_index] * weights[sample_index];
+            valid_weight += weights[sample_index];
+        }
+    }
+    return valid_weight > 1e-6
+        ? moments / valid_weight
+        : float2(0.0);
 }
 
 float surface_probe_soft_normal_weight(
@@ -431,7 +530,7 @@ float surface_probe_chebyshev_visibility(
     return max(saturate((probability - 0.2) / 0.8), 0.05);
 }
 
-float surface_probe_fallback_visibility(
+float surface_probe_radial_visibility(
     ByteAddressBuffer radial_moments,
     ByteAddressBuffer irradiance,
     StructuredBuffer<SurfaceProbe> probes,
@@ -450,41 +549,27 @@ float surface_probe_fallback_visibility(
         return 1.0;
     float3 local = Frame(normalize(probe.normal_side.xyz)).to_local(
         delta / distance);
-    float tangent_fraction = length(local.xy);
-    if (tangent_fraction <= 0.1)
-        return 1.0;
-
-    float azimuth = atan2(local.y, local.x);
-    float sector_coordinate =
-        (azimuth / TWO_PI + 0.5) * float(SURFACE_PROBE_RADIAL_SECTOR_COUNT)
-        - 0.5;
-    int base_sector = int(floor(sector_coordinate));
-    float blend = frac(sector_coordinate);
-    uint sector0 = uint(
-        (base_sector % int(SURFACE_PROBE_RADIAL_SECTOR_COUNT)
-            + int(SURFACE_PROBE_RADIAL_SECTOR_COUNT))
-        % int(SURFACE_PROBE_RADIAL_SECTOR_COUNT));
-    uint sector1 = (sector0 + 1u) & 7u;
     float normalized_distance = min(
         distance / max(kernel_radius, 1e-6), 2.0);
-    float visibility0 = surface_probe_chebyshev_visibility(
-        surface_probe_load_radial_moments(
-            radial_moments, probe_index, sector0),
+    float valid_weight = 0.0;
+    float2 moments = surface_probe_sample_radial_moments(
+        radial_moments,
+        probe_index,
+        surface_probe_hemi_oct_encode(local),
+        valid_weight);
+    if (valid_weight <= 1e-6)
+        return 1.0;
+    float visibility = surface_probe_chebyshev_visibility(
+        moments,
         normalized_distance);
-    float visibility1 = surface_probe_chebyshev_visibility(
-        surface_probe_load_radial_moments(
-            radial_moments, probe_index, sector1),
-        normalized_distance);
-    float visibility = lerp(visibility0, visibility1, blend);
     float temporal_confidence = saturate(
         float(surface_probe_load_sample_count(irradiance, probe_index))
         / 32.0);
-    float directional_confidence = smoothstep(0.2, 0.8, tangent_fraction);
     // This is deliberately a soft prior, not a binary visibility decision.
     return lerp(
         1.0,
         visibility,
-        0.75 * temporal_confidence * directional_confidence);
+        0.75 * temporal_confidence);
 }
 
 float3 surface_probe_reconstruct_irradiance(

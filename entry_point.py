@@ -176,8 +176,8 @@ def parse_args() -> argparse.Namespace:
         "--surface-probe-no-radial-visibility",
         action="store_true",
         help=(
-            "Disable the 8-sector RG16F radial-moment visibility prior used "
-            "only by the 2R fallback tier."
+            "Disable the 4x4 hemi-octahedral RG16F radial-depth visibility "
+            "prior used by primary and 2R surface-probe reconstruction."
         ),
     )
     parser.add_argument(

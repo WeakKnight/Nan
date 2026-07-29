@@ -5,12 +5,17 @@ import numpy as np
 from scene_node import SceneNode
 from surface_probes import (
     SURFACE_PROBE_FLAG_PROTECTED,
+    SURFACE_PROBE_INSTANCE_SHIFT,
     SURFACE_PROBE_INSTANCE_SIZE,
     SURFACE_PROBE_METADATA_SIZE,
     SURFACE_PROBE_NODE_SIZE,
+    SURFACE_PROBE_RADIAL_DEPTH_DIM,
+    SURFACE_PROBE_RADIAL_MOMENT_SIZE,
     SurfaceProbeLayout,
     _build_point_octree_python,
     adaptive_weighted_sample_elimination,
+    surface_probe_hemi_oct_decode,
+    surface_probe_hemi_oct_encode,
     weighted_sample_elimination,
 )
 from surface_probe_sampler import (
@@ -25,7 +30,6 @@ from surface_probe_sampler import (
 )
 from surface_probe_path_tracing_renderer import (
     SURFACE_PROBE_DEBUG_VIEWS,
-    SURFACE_PROBE_RADIAL_MOMENT_SIZE,
     SURFACE_PROBE_SELF_HIT_SIZE,
     SurfaceProbePathTracingRenderer,
 )
@@ -34,7 +38,8 @@ from surface_probe_path_tracing_renderer import (
 class SurfaceProbeRendererConfigurationTests(unittest.TestCase):
     def test_only_active_debug_resources_are_allocated(self):
         self.assertEqual(SURFACE_PROBE_SELF_HIT_SIZE, 4)
-        self.assertEqual(SURFACE_PROBE_RADIAL_MOMENT_SIZE, 32)
+        self.assertEqual(SURFACE_PROBE_RADIAL_DEPTH_DIM, 4)
+        self.assertEqual(SURFACE_PROBE_RADIAL_MOMENT_SIZE, 64)
         self.assertEqual(
             SURFACE_PROBE_DEBUG_VIEWS,
             (
@@ -48,6 +53,44 @@ class SurfaceProbeRendererConfigurationTests(unittest.TestCase):
                 "Vertex Confidence",
             ),
         )
+
+
+class SurfaceProbeRadialDepthTests(unittest.TestCase):
+    def test_hemi_oct_canonical_directions_cover_the_square(self):
+        directions = np.asarray(
+            [
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(
+            surface_probe_hemi_oct_encode(directions),
+            np.asarray(
+                [
+                    [0.5, 0.5],
+                    [1.0, 1.0],
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                ],
+                dtype=np.float32,
+            ),
+            atol=1e-6,
+        )
+
+    def test_hemi_oct_round_trip_preserves_hemisphere_directions(self):
+        rng = np.random.default_rng(20260728)
+        directions = rng.normal(size=(4096, 3)).astype(np.float32)
+        directions[:, 2] = np.abs(directions[:, 2])
+        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+        decoded = surface_probe_hemi_oct_decode(
+            surface_probe_hemi_oct_encode(directions)
+        )
+        np.testing.assert_allclose(decoded, directions, atol=2e-6)
 
 
 class PointOctreeParityTests(unittest.TestCase):
@@ -798,6 +841,14 @@ class SurfaceProbeLayoutTests(unittest.TestCase):
             self.layout.density_m_p95,
             self.layout.max_density_multiplier,
         )
+        for instance_index, info in enumerate(self.layout.instance_infos):
+            packed_instances = (
+                self.layout.probes["meta"][
+                    info.probe_offset : info.probe_offset + info.probe_count, 3
+                ]
+                >> SURFACE_PROBE_INSTANCE_SHIFT
+            )
+            self.assertTrue(np.all(packed_instances == instance_index))
 
     def test_compact_octree_ranges_are_valid(self):
         for info in self.layout.instance_infos:

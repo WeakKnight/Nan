@@ -8,7 +8,11 @@ from scene import Scene
 from surface_probe_path_tracer import SurfaceProbePathTracer
 from surface_probe_resolve import SurfaceProbeResolve
 from surface_probe_vertex_lighting import SurfaceProbeVertexLighting
-from surface_probes import SURFACE_PROBE_PAYLOAD_SIZE, SurfaceProbeLayout
+from surface_probes import (
+    SURFACE_PROBE_PAYLOAD_SIZE,
+    SURFACE_PROBE_RADIAL_MOMENT_SIZE,
+    SurfaceProbeLayout,
+)
 from tone_mapper import ToneMapper
 
 
@@ -20,7 +24,6 @@ SURFACE_PROBE_SELF_HIT_SIZE = 4
 SURFACE_PROBE_RADIAL_MOMENT_BUFFER_KEY = (
     "surface_probe_renderer.probe_radial_moments"
 )
-SURFACE_PROBE_RADIAL_MOMENT_SIZE = 32
 SURFACE_PROBE_DEBUG_VIEWS = (
     "Beauty",
     "Gather Count",
@@ -155,17 +158,23 @@ class SurfaceProbePathTracingRenderer:
             device,
             scene,
             self.path_tracer,
+            defer_layout=not self._build_vertex_lighting_requested,
             profile_sink=profile_sink,
         )
-        print(
-            "[VertexLightingCoverage] "
-            f"vertices={self.vertex_lighting.layout.vertex_count:,}; "
-            f"zero_projection="
-            f"{self.vertex_lighting.layout.zero_projection_vertex_count:,}; "
-            f"partial_projection="
-            f"{self.vertex_lighting.layout.partial_projection_vertex_count:,}; "
-            "zero/partial vertices use same-instance spatial gather fallback"
-        )
+        if self.vertex_lighting.layout is None:
+            print(
+                "[VertexLightingCoverage] deferred until Build Vertex Lighting"
+            )
+        else:
+            print(
+                "[VertexLightingCoverage] "
+                f"vertices={self.vertex_lighting.layout.vertex_count:,}; "
+                f"zero_projection="
+                f"{self.vertex_lighting.layout.zero_projection_vertex_count:,}; "
+                f"partial_projection="
+                f"{self.vertex_lighting.layout.partial_projection_vertex_count:,}; "
+                "zero/partial vertices use same-instance spatial gather fallback"
+            )
         self.resolve = SurfaceProbeResolve(
             device,
             scene,
@@ -287,18 +296,21 @@ class SurfaceProbePathTracingRenderer:
             f"f_p50={self.layout.support_f_p50:.3f}; "
             f"m_p95={self.layout.density_m_p95:.2f}"
         )
-        print(
-            "[VertexLighting] "
-            f"{self.vertex_lighting.layout.vertex_count:,} instance vertices, "
-            f"{self.vertex_lighting.layout.projection_sample_count:,} "
-            "area-projection contributions, "
-            f"{self.vertex_lighting.layout.edge_count:,} directed topology "
-            f"edges, {self.vertex_lighting.layout.weld_edge_count:,} seam "
-            f"welds, condition mean="
-            f"{self.vertex_lighting.layout.condition_mean:.2f}, "
-            f"p95={self.vertex_lighting.layout.condition_p95:.2f}, "
-            f"RGBM={self.vertex_lighting.layout.vertex_count * 4 / (1024 * 1024):.2f} MiB"
-        )
+        if self.vertex_lighting.layout is None:
+            print("[VertexLighting] layout deferred")
+        else:
+            print(
+                "[VertexLighting] "
+                f"{self.vertex_lighting.layout.vertex_count:,} instance vertices, "
+                f"{self.vertex_lighting.layout.projection_sample_count:,} "
+                "area-projection contributions, "
+                f"{self.vertex_lighting.layout.edge_count:,} directed topology "
+                f"edges, {self.vertex_lighting.layout.weld_edge_count:,} seam "
+                f"welds, condition mean="
+                f"{self.vertex_lighting.layout.condition_mean:.2f}, "
+                f"p95={self.vertex_lighting.layout.condition_p95:.2f}, "
+                f"RGBM={self.vertex_lighting.layout.vertex_count * 4 / (1024 * 1024):.2f} MiB"
+            )
         if self.profile_build:
             status_logging_elapsed = (
                 time.perf_counter() - status_logging_start
@@ -453,6 +465,19 @@ class SurfaceProbePathTracingRenderer:
                 self.reset_probes = False
             self.probe_iteration += 1
 
+        if (
+            self._build_vertex_lighting_requested
+            and self.probe_iteration >= self.vertex_lighting_build_iteration
+            and self.vertex_lighting.layout is None
+        ):
+            layout = self.vertex_lighting.ensure_layout()
+            print(
+                "[VertexLightingCoverage] "
+                f"vertices={layout.vertex_count:,}; "
+                f"zero_projection={layout.zero_projection_vertex_count:,}; "
+                f"partial_projection={layout.partial_projection_vertex_count:,}; "
+                "zero/partial vertices use same-instance spatial gather fallback"
+            )
         vertex_lighting_rgbm = self.vertex_lighting.packed_buffer(render_data)
         vertex_lighting_target = self.vertex_lighting.target_buffer(render_data)
         if (
@@ -620,7 +645,7 @@ class SurfaceProbePathTracingRenderer:
         )
         self.radial_visibility_check_box = spy.ui.CheckBox(
             ui_window,
-            "Fallback Radial Visibility",
+            "4x4 Radial Visibility",
             value=self.radial_visibility,
         )
         if self.layout.total_vertex_anchor_probe_count > 0:

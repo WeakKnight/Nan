@@ -56,27 +56,22 @@ class SurfaceProbePathTracer:
         reset: bool = False,
     ) -> None:
         with command_encoder.begin_compute_pass() as pass_encoder:
-            for instance_index, instance_info in enumerate(
-                self.layout.instance_infos
-            ):
-                if instance_info.probe_count <= 0:
-                    continue
-                shader_object = pass_encoder.bind_pipeline(self.pipeline)
-                cursor = spy.ShaderCursor(shader_object)
-                cursor.g_probe_irradiance = output
-                cursor.g_probe_self_hit_counters = self_hit_counters
-                cursor.g_probe_radial_moments = radial_moments
-                cursor.g_surface_probes = self.probe_buffer
-                cursor.g_surface_probe_instances = self.instance_buffer
-                cursor.g_triangle_vertex_probes = (
-                    self.triangle_vertex_probe_buffer
-                )
-                cursor.g_instance_index = instance_index
-                cursor.g_iteration = max(0, int(iteration))
-                cursor.g_samples_per_probe = self.samples_per_probe
-                cursor.g_max_bounces = self.max_bounces
-                cursor.g_reset = 1 if reset else 0
-                self.scene.bind(cursor.g_scene)
-                pass_encoder.dispatch(
-                    thread_count=[instance_info.probe_count, 1, 1]
-                )
+            shader_object = pass_encoder.bind_pipeline(self.pipeline)
+            cursor = spy.ShaderCursor(shader_object)
+            cursor.g_probe_irradiance = output
+            cursor.g_probe_self_hit_counters = self_hit_counters
+            cursor.g_probe_radial_moments = radial_moments
+            cursor.g_surface_probes = self.probe_buffer
+            cursor.g_surface_probe_instances = self.instance_buffer
+            cursor.g_triangle_vertex_probes = (
+                self.triangle_vertex_probe_buffer
+            )
+            cursor.g_probe_count = self.layout.total_probe_count
+            cursor.g_iteration = max(0, int(iteration))
+            cursor.g_samples_per_probe = self.samples_per_probe
+            cursor.g_max_bounces = self.max_bounces
+            cursor.g_reset = 1 if reset else 0
+            self.scene.bind(cursor.g_scene)
+            pass_encoder.dispatch(
+                thread_count=[self.layout.total_probe_count, 1, 1]
+            )

@@ -8,7 +8,7 @@ RWByteAddressBuffer g_probe_radial_moments;
 StructuredBuffer<SurfaceProbe> g_surface_probes;
 StructuredBuffer<SurfaceProbeInstanceInfo> g_surface_probe_instances;
 StructuredBuffer<uint4> g_triangle_vertex_probes;
-uniform uint g_instance_index;
+uniform uint g_probe_count;
 uniform uint g_iteration;
 uniform uint g_samples_per_probe;
 uniform uint g_max_bounces;
@@ -75,27 +75,43 @@ void store_accumulated_self_hit_count(
 
 void clear_radial_moments(uint probe_index)
 {
-    for (uint sector = 0u;
-         sector < SURFACE_PROBE_RADIAL_SECTOR_COUNT;
-         sector++)
+    for (uint texel = 0u;
+         texel < SURFACE_PROBE_RADIAL_TEXEL_COUNT;
+         texel++)
     {
         surface_probe_store_radial_moments(
             g_probe_radial_moments,
             probe_index,
-            sector,
+            texel,
             float2(0.0));
     }
 }
 
+float radial_texel_cosine_probability(uint texel)
+{
+    uint2 coord = uint2(
+        texel % SURFACE_PROBE_RADIAL_DEPTH_DIM,
+        texel / SURFACE_PROBE_RADIAL_DEPTH_DIM);
+    bool horizontal_border =
+        coord.x == 0u || coord.x == SURFACE_PROBE_RADIAL_DEPTH_DIM - 1u;
+    bool vertical_border =
+        coord.y == 0u || coord.y == SURFACE_PROBE_RADIAL_DEPTH_DIM - 1u;
+    if (horizontal_border && vertical_border)
+        return 0.02221812;
+    if (horizontal_border || vertical_border)
+        return 0.06578385;
+    return 0.09621418;
+}
+
 void accumulate_radial_moment(
     uint probe_index,
-    uint sector,
+    uint texel,
     float normalized_distance,
     uint previous_iteration_count,
-    uint local_sector_sample_count)
+    uint local_texel_sample_count)
 {
     float2 previous = surface_probe_load_radial_moments(
-        g_probe_radial_moments, probe_index, sector);
+        g_probe_radial_moments, probe_index, texel);
     float sample = clamp(normalized_distance, 0.0, 2.0);
     float2 sample_moments = float2(sample, sample * sample);
     if (previous.y <= 0.0)
@@ -104,21 +120,26 @@ void accumulate_radial_moment(
     }
     else
     {
-        // RG16F intentionally carries no count.  The expected per-sector
-        // population gives a stable streaming mean while keeping the payload
-        // at exactly four bytes per sector.
-        uint expected_previous = max(
-            previous_iteration_count * max(g_samples_per_probe, 1u)
-                / SURFACE_PROBE_RADIAL_SECTOR_COUNT,
-            1u);
+        // RG16F intentionally carries no count.  Hemi-oct texels have unequal
+        // cosine-sampling probability, so use the calibrated population of
+        // this texel instead of assuming a uniform 1/16 distribution.
+        float previous_sample_population =
+            float(previous_iteration_count)
+            * float(max(g_samples_per_probe, 1u))
+            * radial_texel_cosine_probability(texel);
+        uint expected_previous = previous_iteration_count == 0u
+            ? local_texel_sample_count - 1u
+            : max(uint(previous_sample_population), 1u);
         float alpha = 1.0 / float(
-            min(expected_previous + local_sector_sample_count, 4096u));
+            max(
+                min(expected_previous + local_texel_sample_count, 4096u),
+                1u));
         previous = lerp(previous, sample_moments, alpha);
     }
     surface_probe_store_radial_moments(
         g_probe_radial_moments,
         probe_index,
-        sector,
+        texel,
         clamp(previous, 0.0, 4.0));
 }
 
@@ -192,8 +213,13 @@ float3 estimate_surface_irradiance(
     self_hit_suspect_count = 0u;
     uint previous_iteration_count =
         g_reset != 0 ? 0u : load_cached_sample_count(probe_index);
-    uint local_sector_counts[SURFACE_PROBE_RADIAL_SECTOR_COUNT] =
-        { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+    uint local_texel_counts[SURFACE_PROBE_RADIAL_TEXEL_COUNT] =
+    {
+        0u, 0u, 0u, 0u,
+        0u, 0u, 0u, 0u,
+        0u, 0u, 0u, 0u,
+        0u, 0u, 0u, 0u
+    };
     if (g_reset != 0)
         clear_radial_moments(probe_index);
     for (uint sample_index = 0; sample_index < local_sample_count; sample_index++)
@@ -228,18 +254,16 @@ float3 estimate_surface_irradiance(
             trace_radiance(path);
             rng = path.rng;
             self_hit_suspect_count += path.self_hit_suspect_count;
-            float azimuth = atan2(direction_sample.y, direction_sample.x);
-            uint sector = min(
-                uint((azimuth / TWO_PI + 0.5)
-                    * float(SURFACE_PROBE_RADIAL_SECTOR_COUNT)),
-                SURFACE_PROBE_RADIAL_SECTOR_COUNT - 1u);
-            local_sector_counts[sector] += 1u;
+            uint radial_texel = surface_probe_radial_texel_index(
+                surface_probe_radial_texel_coord(
+                    surface_probe_hemi_oct_encode(direction_sample.xyz)));
+            local_texel_counts[radial_texel] += 1u;
             accumulate_radial_moment(
                 probe_index,
-                sector,
+                radial_texel,
                 path.first_hit_distance / max(kernel_radius, 1e-6),
                 previous_iteration_count,
-                local_sector_counts[sector]);
+                local_texel_counts[radial_texel]);
             sample_irradiance +=
                 path.radiance * abs(direction_sample.z) / direction_sample.w;
         }
@@ -252,23 +276,23 @@ float3 estimate_surface_irradiance(
 [numthreads(256, 1, 1)]
 void compute_main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
-    SurfaceProbeInstanceInfo instance_info = surface_probe_get_instance(
-        g_surface_probe_instances, g_instance_index);
-    uint local_probe = dispatch_thread_id.x;
-    if (local_probe >= instance_info.offsets.w)
+    uint probe_index = dispatch_thread_id.x;
+    if (probe_index >= g_probe_count)
         return;
 
-    uint probe_index = instance_info.offsets.z + local_probe;
     SurfaceProbe probe = surface_probe_load(g_surface_probes, probe_index);
+    uint instance_index = surface_probe_instance_index(probe);
+    SurfaceProbeInstanceInfo instance_info = surface_probe_get_instance(
+        g_surface_probe_instances, instance_index);
 
     HitInfo surface_hit;
     surface_hit.valid = true;
     surface_hit.bary = float2(asfloat(probe.meta.y), asfloat(probe.meta.z));
-    surface_hit.instance_id = g_instance_index;
+    surface_hit.instance_id = instance_index;
     surface_hit.primitive_index = probe.meta.x;
 
     RNG rng = RNG(
-        uint2(probe_index, g_instance_index),
+        uint2(probe_index, instance_index),
         g_iteration * max(g_samples_per_probe, 1u));
     float3 view_direction = normalize(probe.normal_side.xyz);
     uint self_hit_suspect_count;

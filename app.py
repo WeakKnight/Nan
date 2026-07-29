@@ -283,6 +283,18 @@ class App:
             spy.ui.Button(ui_window, "Save Scene Camera", callback=self._save_scene_camera_config)
             spy.ui.Button(ui_window, "Reload Scene Camera", callback=self._reload_scene_camera_config)
             self._scene_camera_status_text = spy.ui.Text(ui_window, self._scene_camera_status)
+
+            def on_camera_speed_changed(value: float) -> None:
+                self.camera_controller.set_move_speed_percent(value)
+
+            spy.ui.SliderFloat(
+                ui_window,
+                "Camera Speed %",
+                min=CameraController.MOVE_SPEED_PERCENT_MIN,
+                max=CameraController.MOVE_SPEED_PERCENT_MAX,
+                value=self.camera_controller.move_speed_percent,
+                callback=on_camera_speed_changed,
+            )
             self.scene.setup_ui(
                 self.ui,
                 ui_window,

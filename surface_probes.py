@@ -19,15 +19,88 @@ SURFACE_PROBE_PAYLOAD_SIZE = 16
 SURFACE_PROBE_METADATA_SIZE = 48
 SURFACE_PROBE_NODE_SIZE = 16
 SURFACE_PROBE_INSTANCE_SIZE = 48
+SURFACE_PROBE_RADIAL_DEPTH_DIM = 4
+SURFACE_PROBE_RADIAL_MOMENT_SIZE = (
+    SURFACE_PROBE_RADIAL_DEPTH_DIM * SURFACE_PROBE_RADIAL_DEPTH_DIM * 4
+)
 SURFACE_PROBE_FLAG_BACK_SIDE = 1 << 0
 SURFACE_PROBE_FLAG_VERTEX_ANCHOR = 1 << 1
 SURFACE_PROBE_FLAG_PROTECTED = 1 << 2
+SURFACE_PROBE_INSTANCE_SHIFT = 8
 SURFACE_PROBE_HARD_NORMAL_COSINE = math.cos(math.radians(80.0))
 
 SurfaceProbeSamplerBackend = Literal["auto", "cpp", "python"]
 _cpp_sampler_fallback_warning_printed = False
 
 _NEIGHBOR_CELL_OFFSETS = tuple(product((-1, 0, 1), repeat=3))
+
+
+def surface_probe_hemi_oct_encode(
+    directions: npt.ArrayLike,
+) -> npt.NDArray[np.float32]:
+    """CPU reference for the shader's complete-hemisphere oct encoding."""
+    direction_array = np.asarray(directions, dtype=np.float64)
+    if direction_array.shape[-1:] != (3,):
+        raise ValueError("directions must have a final dimension of 3")
+    hemisphere = direction_array.copy()
+    hemisphere[..., 2] = np.maximum(hemisphere[..., 2], 0.0)
+    lengths = np.linalg.norm(hemisphere, axis=-1, keepdims=True)
+    normalized = np.divide(
+        hemisphere,
+        lengths,
+        out=np.zeros_like(hemisphere),
+        where=lengths > 1e-12,
+    )
+    inverse_l1 = 1.0 / np.maximum(
+        np.sum(np.abs(normalized), axis=-1),
+        1e-12,
+    )
+    octahedral = normalized[..., :2] * inverse_l1[..., None]
+    square = np.stack(
+        (
+            octahedral[..., 0] + octahedral[..., 1],
+            octahedral[..., 0] - octahedral[..., 1],
+        ),
+        axis=-1,
+    )
+    return np.asarray(np.clip(square * 0.5 + 0.5, 0.0, 1.0), dtype=np.float32)
+
+
+def surface_probe_hemi_oct_decode(
+    uv: npt.ArrayLike,
+) -> npt.NDArray[np.float32]:
+    """Inverse CPU reference for outward-hemisphere directions."""
+    uv_array = np.asarray(uv, dtype=np.float64)
+    if uv_array.shape[-1:] != (2,):
+        raise ValueError("uv must have a final dimension of 2")
+    square = np.clip(uv_array, 0.0, 1.0) * 2.0 - 1.0
+    octahedral = np.stack(
+        (
+            0.5 * (square[..., 0] + square[..., 1]),
+            0.5 * (square[..., 0] - square[..., 1]),
+        ),
+        axis=-1,
+    )
+    direction = np.concatenate(
+        (
+            octahedral,
+            np.maximum(
+                1.0 - np.sum(np.abs(octahedral), axis=-1, keepdims=True),
+                0.0,
+            ),
+        ),
+        axis=-1,
+    )
+    lengths = np.linalg.norm(direction, axis=-1, keepdims=True)
+    return np.asarray(
+        np.divide(
+            direction,
+            lengths,
+            out=np.zeros_like(direction),
+            where=lengths > 1e-12,
+        ),
+        dtype=np.float32,
+    )
 
 SURFACE_PROBE_DTYPE = np.dtype(
     [
@@ -116,13 +189,32 @@ class _InstanceBuildState:
 @dataclass
 class _AdaptiveInstancePrepass:
     instance_index: int
-    triangles: npt.NDArray[np.float32]
-    triangle_indices: npt.NDArray[np.uint32]
-    mesh_triangle_indices: npt.NDArray[np.uint32]
     triangle_areas: npt.NDArray[np.float64]
     surface_area: float
     triangle_densities: npt.NDArray[np.float32]
     adaptive_mass: float
+
+
+def _instance_metric_key(
+    scene_node: SceneNode,
+    instance_index: int,
+) -> tuple[int, tuple[float, ...]]:
+    """Key geometry computations that are invariant to rigid transforms.
+
+    Surface area, compatible support, and adaptive density depend on the mesh
+    and on the metric induced by its linear transform, but not on world
+    translation or rotation. Quantizing the Gram matrix folds the small
+    floating-point drift present in repeated glTF node rotations while keeping
+    genuinely different scale/shear transforms separate.
+    """
+
+    mesh_id, _, transform_id = scene_node.instances[instance_index]
+    transform = np.asarray(
+        scene_node.transforms[transform_id].matrix.to_numpy(),
+        dtype=np.float64,
+    )
+    metric = transform[:3, :3].T @ transform[:3, :3]
+    return mesh_id, tuple(np.round(metric.reshape(-1), decimals=8))
 
 
 class _PointGrid:
@@ -381,6 +473,35 @@ def _subset_candidates(
     )
 
 
+def _limit_candidates(
+    candidates: _InstanceCandidates,
+    maximum_count: int,
+    seed: int,
+) -> _InstanceCandidates:
+    """Deterministically cap a diagnostic/audit candidate population.
+
+    Full triangle-corner and render-vertex audits are useful on asset-sized
+    meshes, but scale with instanced triangle count rather than with the
+    requested Surface Probe budget. Large modular worlds can contain tens of
+    millions of instanced triangles, making an unbounded audit several times
+    larger than the actual WSE population. The cap keeps a representative,
+    stable subset while the independent random consumer sequence continues to
+    cover the complete area distribution.
+    """
+
+    maximum_count = max(0, int(maximum_count))
+    count = int(candidates.positions.shape[0])
+    if count <= maximum_count:
+        return candidates
+    if maximum_count == 0:
+        return _combine_candidate_sets([], candidates.surface_area)
+    rng = np.random.default_rng(int(seed))
+    selected = np.sort(
+        rng.choice(count, size=maximum_count, replace=False).astype(np.int64)
+    )
+    return _subset_candidates(candidates, selected)
+
+
 def _repeat_candidate_subset_by_count(
     candidates: _InstanceCandidates,
     indices: npt.ArrayLike,
@@ -496,25 +617,83 @@ def _triangle_inset_corner_candidates(
     )
 
 
+def _boundary_edge_topology(
+    mesh_triangle_indices: npt.NDArray[np.uint32],
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    int,
+]:
+    """Group mesh edge incidences once, independently of instance transforms."""
+
+    local_edges = np.asarray(((0, 1), (1, 2), (2, 0)), dtype=np.int64)
+    edge_vertices = mesh_triangle_indices[:, local_edges].reshape(-1, 2)
+    if edge_vertices.shape[0] == 0:
+        empty = np.zeros((0,), dtype=np.int64)
+        return empty, empty, empty, 0
+    edge_keys = np.sort(edge_vertices, axis=1)
+    order = np.lexsort((edge_keys[:, 1], edge_keys[:, 0])).astype(
+        np.int64, copy=False
+    )
+    sorted_keys = edge_keys[order]
+    group_starts = np.empty((order.size,), dtype=np.bool_)
+    group_starts[0] = True
+    group_starts[1:] = np.any(sorted_keys[1:] != sorted_keys[:-1], axis=1)
+    group_ids = np.cumsum(group_starts, dtype=np.int64) - 1
+    return (
+        (order // 3).astype(np.int64, copy=False),
+        (order % 3).astype(np.int64, copy=False),
+        group_ids,
+        int(group_ids[-1]) + 1 if group_ids.size else 0,
+    )
+
+
 def _boundary_edge_candidates(
     triangles: npt.NDArray[np.float32],
     triangle_indices: npt.NDArray[np.uint32],
     mesh_triangle_indices: npt.NDArray[np.uint32],
     spacing: float,
     surface_area: float,
+    topology: tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        int,
+    ]
+    | None = None,
 ) -> _InstanceCandidates:
-    local_edges = np.asarray(((0, 1), (1, 2), (2, 0)), dtype=np.int64)
-    edge_vertices = mesh_triangle_indices[:, local_edges].reshape(-1, 2)
-    edge_keys = np.sort(edge_vertices, axis=1)
-    _, first, counts = np.unique(
-        edge_keys, axis=0, return_index=True, return_counts=True
-    )
-    boundary_flat = np.sort(first[counts == 1])
-    if boundary_flat.size == 0:
+    if topology is None:
+        topology = _boundary_edge_topology(mesh_triangle_indices)
+        topology_triangle_indices = np.arange(
+            triangles.shape[0], dtype=np.uint32
+        )
+    else:
+        topology_triangle_indices = triangle_indices
+    sorted_faces, sorted_local_edges, group_ids, group_count = topology
+    if sorted_faces.size == 0:
         return _combine_candidate_sets([], surface_area)
 
-    face_indices = boundary_flat // 3
-    local_edge_indices = boundary_flat % 3
+    face_count = int(np.max(sorted_faces)) + 1
+    active_faces = np.zeros((face_count,), dtype=np.bool_)
+    active_faces[topology_triangle_indices.astype(np.int64)] = True
+    active_edges = active_faces[sorted_faces]
+    active_group_counts = np.bincount(
+        group_ids[active_edges], minlength=group_count
+    )
+    boundary_entries = active_edges & (
+        active_group_counts[group_ids] == 1
+    )
+    if not np.any(boundary_entries):
+        return _combine_candidate_sets([], surface_area)
+    original_faces = sorted_faces[boundary_entries]
+    local_edge_indices = sorted_local_edges[boundary_entries]
+    face_lookup = np.full((face_count,), -1, dtype=np.int64)
+    face_lookup[topology_triangle_indices.astype(np.int64)] = np.arange(
+        triangles.shape[0], dtype=np.int64
+    )
+    face_indices = face_lookup[original_faces]
+    local_edges = np.asarray(((0, 1), (1, 2), (2, 0)), dtype=np.int64)
     edge_starts = local_edges[local_edge_indices, 0]
     edge_ends = local_edges[local_edge_indices, 1]
     start_positions = triangles[face_indices, edge_starts]
@@ -1087,9 +1266,12 @@ def _make_probe_records(
     selected_indices: npt.NDArray[np.int64],
     radius: float,
     double_sided: bool,
+    instance_index: int,
     support_f: npt.NDArray[np.float32] | None = None,
     extra_flags: int = 0,
 ) -> np.ndarray:
+    if instance_index < 0 or instance_index >= (1 << (32 - SURFACE_PROBE_INSTANCE_SHIFT)):
+        raise ValueError("Surface probe instance index cannot be packed into metadata")
     side_count = 2 if double_sided else 1
     records = np.zeros(
         (selected_indices.shape[0] * side_count,),
@@ -1120,6 +1302,7 @@ def _make_probe_records(
         records["meta"][start:end, 3] = np.uint32(
             int(extra_flags)
             | (SURFACE_PROBE_FLAG_BACK_SIDE if side_index == 1 else 0)
+            | (int(instance_index) << SURFACE_PROBE_INSTANCE_SHIFT)
         )
     return records
 
@@ -1357,19 +1540,22 @@ class SurfaceProbeLayout:
             sampler_backend
         )
 
-        triangle_sets = []
         areas = []
         valid_instance_indices = []
+        instance_metric_keys: list[tuple[int, tuple[float, ...]]] = []
+        area_cache: dict[tuple[int, tuple[float, ...]], float] = {}
         for instance_index in range(len(scene_node.instances)):
-            triangles, triangle_indices, mesh_triangle_indices, area = _instance_triangles(
-                scene_node, instance_index
-            )
+            metric_key = _instance_metric_key(scene_node, instance_index)
+            area = area_cache.get(metric_key)
+            if area is None:
+                _, _, _, area = _instance_triangles(
+                    scene_node, instance_index
+                )
+                area_cache[metric_key] = area
             if area <= 0.0:
                 continue
             valid_instance_indices.append(instance_index)
-            triangle_sets.append(
-                (triangles, triangle_indices, mesh_triangle_indices)
-            )
+            instance_metric_keys.append(metric_key)
             areas.append(area)
         if not valid_instance_indices:
             raise ValueError("Surface probes require at least one valid triangle")
@@ -1391,86 +1577,128 @@ class SurfaceProbeLayout:
             ),
         )
         adaptive_prepasses: list[_AdaptiveInstancePrepass] = []
+        adaptive_prepass_cache: dict[
+            tuple[tuple[int, tuple[float, ...]], int],
+            tuple[
+                npt.NDArray[np.float64],
+                float,
+                npt.NDArray[np.float32],
+                float,
+            ],
+        ] = {}
         for valid_index, instance_index in enumerate(valid_instance_indices):
-            triangles, triangle_indices, mesh_triangle_indices = triangle_sets[
-                valid_index
-            ]
-            edge_a = triangles[:, 1] - triangles[:, 0]
-            edge_b = triangles[:, 2] - triangles[:, 0]
-            triangle_areas = (
-                0.5
-                * np.linalg.norm(np.cross(edge_a, edge_b), axis=1)
-            ).astype(np.float64)
-            centroids = _triangle_centroid_candidates(
-                triangles, triangle_indices, float(area_array[valid_index])
+            preliminary_count = int(preliminary_target_counts[valid_index])
+            support_reference_count = (
+                min(preliminary_count * min(oversample_factor, 2), 131_072)
+                if adaptive_wse
+                else 0
             )
-            if adaptive_wse:
-                preliminary_count = int(
-                    preliminary_target_counts[valid_index]
-                )
-                reference_count = max(
-                    preliminary_count,
-                    preliminary_count * min(oversample_factor, 2),
-                )
-                references = _sample_instance_surface(
+            cache_key = (
+                instance_metric_keys[valid_index],
+                support_reference_count,
+            )
+            cached_prepass = adaptive_prepass_cache.get(cache_key)
+            if cached_prepass is None:
+                (
                     triangles,
                     triangle_indices,
-                    reference_count,
-                    int(seed) + instance_index * 1_000_003 + 17,
+                    _,
+                    surface_area,
+                ) = _instance_triangles(scene_node, instance_index)
+                edge_a = triangles[:, 1] - triangles[:, 0]
+                edge_b = triangles[:, 2] - triangles[:, 0]
+                triangle_areas = (
+                    0.5
+                    * np.linalg.norm(np.cross(edge_a, edge_b), axis=1)
+                ).astype(np.float64)
+                centroids = _triangle_centroid_candidates(
+                    triangles, triangle_indices, surface_area
                 )
-                support_references = _combine_candidate_sets(
-                    [references, centroids], float(area_array[valid_index])
-                )
-                reference_area_weights = np.concatenate(
-                    (
-                        np.full(
-                            (references.positions.shape[0],),
-                            0.5
-                            * float(area_array[valid_index])
-                            / references.positions.shape[0],
-                            dtype=np.float32,
+                if adaptive_wse:
+                    references = _sample_instance_surface(
+                        triangles,
+                        triangle_indices,
+                        support_reference_count,
+                        int(seed) + instance_index * 1_000_003 + 17,
+                    )
+                    support_references = _combine_candidate_sets(
+                        [references, centroids], surface_area
+                    )
+                    reference_area_weights = np.concatenate(
+                        (
+                            np.full(
+                                (references.positions.shape[0],),
+                                0.5
+                                * surface_area
+                                / references.positions.shape[0],
+                                dtype=np.float32,
+                            ),
+                            (0.5 * triangle_areas).astype(np.float32),
+                        )
+                    )
+                    zero_instances = np.zeros(
+                        (support_references.positions.shape[0],),
+                        dtype=np.uint32,
+                    )
+                    query_instances = np.zeros(
+                        (centroids.positions.shape[0],), dtype=np.uint32
+                    )
+                    triangle_support = estimate_surface_support(
+                        support_references.positions,
+                        support_references.normals,
+                        zero_instances,
+                        reference_area_weights,
+                        centroids.positions,
+                        centroids.normals,
+                        query_instances,
+                        np.asarray(
+                            [global_kernel_radius], dtype=np.float32
                         ),
-                        (0.5 * triangle_areas).astype(np.float32),
+                        normal_cosine_threshold=normal_cosine_threshold,
+                        max_density_multiplier=max_density_multiplier,
+                        backend=resolved_sampler_backend,
+                    )
+                    triangle_densities = triangle_support.density_m
+                else:
+                    triangle_densities = np.ones(
+                        (triangles.shape[0],), dtype=np.float32
+                    )
+                adaptive_mass = float(
+                    np.sum(
+                        triangle_areas
+                        * triangle_densities.astype(np.float64),
+                        dtype=np.float64,
                     )
                 )
-                zero_instances = np.zeros(
-                    (support_references.positions.shape[0],), dtype=np.uint32
+                cached_prepass = (
+                    triangle_areas,
+                    surface_area,
+                    triangle_densities,
+                    adaptive_mass,
                 )
-                query_instances = np.zeros(
-                    (centroids.positions.shape[0],), dtype=np.uint32
+                adaptive_prepass_cache[cache_key] = cached_prepass
+            if (
+                profile_build
+                and (valid_index + 1) % 256 == 0
+            ):
+                print(
+                    "[SurfaceProbeProfile] adaptive support progress: "
+                    f"{valid_index + 1:,}/{len(valid_instance_indices):,} "
+                    f"instances; {len(adaptive_prepass_cache):,} "
+                    "metric/count templates",
+                    flush=True,
                 )
-                triangle_support = estimate_surface_support(
-                    support_references.positions,
-                    support_references.normals,
-                    zero_instances,
-                    reference_area_weights,
-                    centroids.positions,
-                    centroids.normals,
-                    query_instances,
-                    np.asarray([global_kernel_radius], dtype=np.float32),
-                    normal_cosine_threshold=normal_cosine_threshold,
-                    max_density_multiplier=max_density_multiplier,
-                    backend=resolved_sampler_backend,
-                )
-                triangle_densities = triangle_support.density_m
-            else:
-                triangle_densities = np.ones(
-                    (triangles.shape[0],), dtype=np.float32
-                )
-            adaptive_mass = float(
-                np.sum(
-                    triangle_areas * triangle_densities.astype(np.float64),
-                    dtype=np.float64,
-                )
-            )
+            (
+                triangle_areas,
+                surface_area,
+                triangle_densities,
+                adaptive_mass,
+            ) = cached_prepass
             adaptive_prepasses.append(
                 _AdaptiveInstancePrepass(
                     instance_index=instance_index,
-                    triangles=triangles,
-                    triangle_indices=triangle_indices,
-                    mesh_triangle_indices=mesh_triangle_indices,
                     triangle_areas=triangle_areas,
-                    surface_area=float(area_array[valid_index]),
+                    surface_area=surface_area,
                     triangle_densities=triangle_densities,
                     adaptive_mass=adaptive_mass,
                 )
@@ -1509,6 +1737,15 @@ class SurfaceProbeLayout:
         native_wse_profiles: list[tuple[int, object]] = []
         candidate_filter_workers = 0
         candidate_filter_shards = 0
+        boundary_topology_cache: dict[
+            int,
+            tuple[
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                npt.NDArray[np.int64],
+                int,
+            ],
+        ] = {}
 
         valid_lookup = {
             instance_index: valid_index
@@ -1523,9 +1760,12 @@ class SurfaceProbeLayout:
             target_count = int(target_counts[valid_index])
             candidate_count = max(target_count, target_count * oversample_factor)
             prepass = adaptive_prepasses[valid_index]
-            triangles = prepass.triangles
-            triangle_indices = prepass.triangle_indices
-            mesh_triangle_indices = prepass.mesh_triangle_indices
+            (
+                triangles,
+                triangle_indices,
+                mesh_triangle_indices,
+                _,
+            ) = _instance_triangles(scene_node, instance_index)
             substage_start = time.perf_counter()
             random_candidates = _sample_instance_surface(
                 triangles,
@@ -1550,12 +1790,15 @@ class SurfaceProbeLayout:
             )
             substage_start = time.perf_counter()
             if adaptive_wse:
-                base_candidates = _combine_candidate_sets(
-                    [random_candidates, centroids], prepass.surface_area
+                # WSE obeys the requested target*oversample population.
+                # Triangle centroids belong to the independent audit set;
+                # injecting every instanced triangle into the base population
+                # makes large modular worlds scale with source tessellation
+                # instead of the explicit probe budget.
+                base_candidates = random_candidates
+                candidate_densities = random_densities.astype(
+                    np.float32, copy=False
                 )
-                candidate_densities = np.concatenate(
-                    (random_densities, prepass.triangle_densities)
-                ).astype(np.float32, copy=False)
             else:
                 base_candidates = random_candidates
                 candidate_densities = np.ones(
@@ -1625,12 +1868,22 @@ class SurfaceProbeLayout:
                 1e-5,
             )
             substage_start = time.perf_counter()
+            mesh_id = scene_node.instances[instance_index][0]
+            boundary_topology = boundary_topology_cache.get(mesh_id)
+            if boundary_topology is None:
+                boundary_topology = _boundary_edge_topology(
+                    scene_node.meshes[mesh_id].indices.astype(
+                        np.uint32, copy=False
+                    )
+                )
+                boundary_topology_cache[mesh_id] = boundary_topology
             boundary = _boundary_edge_candidates(
                 triangles,
                 triangle_indices,
                 mesh_triangle_indices,
                 kernel_radius * 0.5,
                 base_candidates.surface_area,
+                topology=boundary_topology,
             )
             candidate_profile_seconds["boundary_candidates"] += (
                 time.perf_counter() - substage_start
@@ -1667,22 +1920,36 @@ class SurfaceProbeLayout:
                 mesh_triangle_indices,
                 prepass.surface_area,
             )
+            geometry_audit_budget = max(64, target_count * 4)
+            per_geometry_source = max(16, geometry_audit_budget // 4)
+            boundary = _limit_candidates(
+                boundary,
+                per_geometry_source,
+                int(seed) + instance_index * 1_000_003 + 10_101,
+            )
+            inset_corners = _limit_candidates(
+                inset_corners,
+                per_geometry_source,
+                int(seed) + instance_index * 1_000_003 + 10_103,
+            )
+            centroid_audit = _limit_candidates(
+                centroids,
+                per_geometry_source,
+                int(seed) + instance_index * 1_000_003 + 10_107,
+            )
+            consumer_vertex_audit = _limit_candidates(
+                consumer_vertices,
+                per_geometry_source,
+                int(seed) + instance_index * 1_000_003 + 10_109,
+            )
             audit_source = _combine_candidate_sets(
                 [
                     boundary,
                     inset_corners,
+                    centroid_audit,
                     base_candidates,
                     consumer_surface,
-                    consumer_vertices,
-                ]
-                if adaptive_wse
-                else [
-                    boundary,
-                    inset_corners,
-                    centroids,
-                    base_candidates,
-                    consumer_surface,
-                    consumer_vertices,
+                    consumer_vertex_audit,
                 ],
                 base_candidates.surface_area,
             )
@@ -1759,32 +2026,17 @@ class SurfaceProbeLayout:
                     random_densities.astype(np.float64), 1.0e-12
                 )
                 random_importance *= (
-                    0.5
-                    * prepass.surface_area
+                    prepass.surface_area
                     / max(float(np.sum(random_importance)), 1.0e-30)
                 )
-                support_area_weights = np.concatenate(
-                    (
-                        random_importance.astype(np.float32),
-                        (0.5 * prepass.triangle_areas).astype(np.float32),
-                    )
-                )
+                support_area_weights = random_importance.astype(np.float32)
             else:
-                support_candidates = _combine_candidate_sets(
-                    [base_candidates, centroids],
-                    base_candidates.surface_area,
-                )
-                support_area_weights = np.concatenate(
-                    (
-                        np.full(
-                            (base_candidates.positions.shape[0],),
-                            0.5
-                            * base_candidates.surface_area
-                            / base_candidates.positions.shape[0],
-                            dtype=np.float32,
-                        ),
-                        (0.5 * prepass.triangle_areas).astype(np.float32),
-                    )
+                support_candidates = base_candidates
+                support_area_weights = np.full(
+                    (base_candidates.positions.shape[0],),
+                    base_candidates.surface_area
+                    / base_candidates.positions.shape[0],
+                    dtype=np.float32,
                 )
             _, material_id, _ = scene_node.instances[instance_index]
             if build_vertex_anchors:
@@ -2249,6 +2501,7 @@ class SurfaceProbeLayout:
                 state.base_selected,
                 state.kernel_radius,
                 state.double_sided,
+                state.instance_index,
                 instance_support_f[:base_support_end],
             )
             repair_records = _make_probe_records(
@@ -2256,6 +2509,7 @@ class SurfaceProbeLayout:
                 repair_selected,
                 state.kernel_radius,
                 state.double_sided,
+                state.instance_index,
                 instance_support_f[base_support_end:repair_support_end],
             )
             protected_selected = protected_selected_by_state[state_index]
@@ -2264,6 +2518,7 @@ class SurfaceProbeLayout:
                 protected_selected,
                 state.kernel_radius,
                 state.double_sided,
+                state.instance_index,
                 instance_support_f[repair_support_end:],
                 extra_flags=SURFACE_PROBE_FLAG_PROTECTED,
             )
@@ -2303,6 +2558,7 @@ class SurfaceProbeLayout:
                 np.arange(anchor_site_count, dtype=np.int64),
                 state.kernel_radius,
                 state.double_sided,
+                state.instance_index,
             )
             anchor_records["meta"][:, 3] |= np.uint32(
                 SURFACE_PROBE_FLAG_VERTEX_ANCHOR
