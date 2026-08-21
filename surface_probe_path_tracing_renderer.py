@@ -7,10 +7,13 @@ from render_data import RenderData
 from scene import Scene
 from surface_probe_fields import (
     DIFFUSE_IRRADIANCE_RGB_FIELD,
+    DIFFUSE_PRT_ATTACHMENTS,
+    DIFFUSE_PRT_L2_RGB_FIELD,
     SURFACE_PROBE_SELF_HIT_SIZE,
     SurfaceProbeRuntimeBuffers,
 )
 from surface_probe_path_tracer import SurfaceProbeDiffuseIrradianceBaker
+from surface_probe_prt import SurfaceProbePrtBaker, SurfaceProbePrtEvaluator
 from surface_probe_resolve import SurfaceProbeResolve
 from surface_probe_resources import SurfaceProbeGpuGeometry
 from surface_probe_vertex_lighting import SurfaceProbeVertexLighting
@@ -51,6 +54,7 @@ class SurfaceProbePathTracingRenderer:
         oversample_factor: int = 5,
         seed: int = 1,
         samples_per_probe: int = 1,
+        field_mode: str = "irradiance",
         max_bounces: int = 3,
         leaf_capacity: int = 8,
         kernel_radius_scale: float = 2.5,
@@ -85,6 +89,9 @@ class SurfaceProbePathTracingRenderer:
         self.oversample_factor = max(1, int(oversample_factor))
         self.seed = int(seed)
         self.samples_per_probe = max(1, int(samples_per_probe))
+        if field_mode not in ("irradiance", "prt-l2"):
+            raise ValueError(f"Unknown Surface Probe field: {field_mode}")
+        self.field_mode = field_mode
         self.max_bounces = max(1, int(max_bounces))
         self.leaf_capacity = max(1, int(leaf_capacity))
         self.kernel_radius_scale = max(0.5, float(kernel_radius_scale))
@@ -134,6 +141,8 @@ class SurfaceProbePathTracingRenderer:
         self._previous_use_vertex_lighting = self.use_vertex_lighting
         self._previous_radial_visibility = self.radial_visibility
         self._build_vertex_lighting_requested = bool(build_vertex_lighting)
+        self._field_evaluation_valid = False
+        self._field_evaluation_signature: tuple[float, ...] | None = None
 
     def initialize(self, device: spy.Device, scene: Scene) -> None:
         initialize_start = time.perf_counter()
@@ -182,14 +191,35 @@ class SurfaceProbePathTracingRenderer:
             self.layout,
             profile_sink=profile_sink,
         )
-        self.field_baker = SurfaceProbeDiffuseIrradianceBaker(
-            device,
-            scene,
-            self.geometry,
-            samples_per_probe=self.samples_per_probe,
-            max_bounces=self.max_bounces,
-            profile_sink=profile_sink,
-        )
+        if self.field_mode == "prt-l2":
+            self.field_desc = DIFFUSE_PRT_L2_RGB_FIELD
+            self.field_attachment_descs = DIFFUSE_PRT_ATTACHMENTS
+            self.field_baker = SurfaceProbePrtBaker(
+                device,
+                scene,
+                self.geometry,
+                samples_per_probe=self.samples_per_probe,
+                max_bounces=self.max_bounces,
+                profile_sink=profile_sink,
+            )
+            self.field_evaluator = SurfaceProbePrtEvaluator(
+                device,
+                scene,
+                self.geometry,
+                profile_sink=profile_sink,
+            )
+        else:
+            self.field_desc = DIFFUSE_IRRADIANCE_RGB_FIELD
+            self.field_attachment_descs = None
+            self.field_baker = SurfaceProbeDiffuseIrradianceBaker(
+                device,
+                scene,
+                self.geometry,
+                samples_per_probe=self.samples_per_probe,
+                max_bounces=self.max_bounces,
+                profile_sink=profile_sink,
+            )
+            self.field_evaluator = None
         self.vertex_lighting = SurfaceProbeVertexLighting(
             device,
             scene,
@@ -296,7 +326,8 @@ class SurfaceProbePathTracingRenderer:
             f"{self.layout.total_probe_count:,} total probes "
             f"(sampler={self.layout.sampler_backend}; "
             f"adaptive_wse={self.layout.adaptive_wse}; "
-            f"{self.layout.total_probe_count * DIFFUSE_IRRADIANCE_RGB_FIELD.bytes_per_probe / (1024 * 1024):.2f} MiB irradiance field+counts; "
+            f"field={self.field_mode}; "
+            f"{self.layout.total_probe_count * self.field_desc.bytes_per_probe / (1024 * 1024):.2f} MiB field+counts; "
             f"{self.layout.total_probe_count * SURFACE_PROBE_SELF_HIT_SIZE / (1024 * 1024):.2f} MiB self-hit counters; "
             f"{self.layout.total_probe_count * SURFACE_PROBE_RADIAL_MOMENT_SIZE / (1024 * 1024):.2f} MiB radial moments; "
             f"{self.layout.probes.nbytes / (1024 * 1024):.2f} MiB metadata)"
@@ -475,9 +506,15 @@ class SurfaceProbePathTracingRenderer:
         probe_runtime = SurfaceProbeRuntimeBuffers.acquire(
             render_data,
             self.layout.total_probe_count,
-            field_desc=DIFFUSE_IRRADIANCE_RGB_FIELD,
+            field_desc=self.field_desc,
+            **(
+                {}
+                if self.field_attachment_descs is None
+                else {"attachment_descs": self.field_attachment_descs}
+            ),
         )
 
+        field_updated = False
         if not self._is_paused() or self.reset_probes:
             resetting = self.reset_probes
             self.field_baker.execute(
@@ -490,6 +527,47 @@ class SurfaceProbePathTracingRenderer:
             if resetting:
                 self.reset_probes = False
             self.probe_iteration += 1
+            field_updated = True
+
+        evaluated_field = probe_runtime.field
+        if self.field_evaluator is not None:
+            lighting_signature = self.field_evaluator.lighting_signature()
+            lighting_changed = (
+                lighting_signature != self._field_evaluation_signature
+            )
+            if (
+                field_updated
+                or lighting_changed
+                or not self._field_evaluation_valid
+            ):
+                evaluated_field = self.field_evaluator.execute(
+                    command_encoder,
+                    render_data,
+                    probe_runtime.field,
+                    probe_runtime.attachments,
+                    project_lighting=lighting_changed
+                    or not self._field_evaluation_valid,
+                )
+                self._field_evaluation_valid = True
+                self._field_evaluation_signature = lighting_signature
+
+                # PRT evaluation is lighting dependent.  Vertex Lighting
+                # consumes the evaluated irradiance field rather than the raw
+                # transport coefficients, so an existing RGBM vertex cache is
+                # stale whenever the projected lighting changes.  Reuse the
+                # already-built topology/layout and refresh only its GPU
+                # gather, smoothing, and pack passes.
+                if lighting_changed and self.vertex_lighting.built:
+                    self._build_vertex_lighting_requested = True
+                    self.reset_accumulator = True
+                    if self.status_text is not None:
+                        self.status_text.text = (
+                            "PRT lighting changed; refreshing Vertex Lighting..."
+                        )
+            else:
+                evaluated_field = (
+                    self.field_evaluator.acquire_evaluated_field(render_data)
+                )
 
         if (
             self._build_vertex_lighting_requested
@@ -529,7 +607,7 @@ class SurfaceProbePathTracingRenderer:
             vertex_lighting_rgbm = self.vertex_lighting.execute(
                 command_encoder,
                 render_data,
-                probe_runtime.field,
+                evaluated_field,
                 probe_runtime.attachments,
                 min_gather_count=self.repair_min_gather,
                 smoothing_passes=smoothing_passes,
@@ -577,7 +655,7 @@ class SurfaceProbePathTracingRenderer:
         )
         self.resolve.execute(
             command_encoder,
-            probe_runtime.field,
+            evaluated_field,
             probe_runtime.attachments,
             resolve_texture,
             debug_view=debug_view,
@@ -654,6 +732,7 @@ class SurfaceProbePathTracingRenderer:
                 + f"vertex anchors: "
                 f"{self.layout.total_vertex_anchor_site_count:,}; "
                 f"probes: {self.layout.total_probe_count:,}"
+                f"; field: {self.field_mode}"
                 "; probe cache: indirect + sky, sun direct: realtime"
                 + (
                     f"; vertex lighting: RGBM, "

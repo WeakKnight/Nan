@@ -5,6 +5,8 @@ import numpy as np
 
 from surface_probe_fields import (
     DIFFUSE_IRRADIANCE_RGB_FIELD,
+    DIFFUSE_PRT_ATTACHMENTS,
+    DIFFUSE_PRT_L2_RGB_FIELD,
     SurfaceProbeFieldDesc,
     SurfaceProbeFieldSemantic,
     SurfaceProbeFieldStorage,
@@ -41,29 +43,25 @@ class SurfaceProbeFieldTests(unittest.TestCase):
     def test_invalid_field_shape_is_rejected(self):
         with self.assertRaises(ValueError):
             SurfaceProbeFieldDesc(
-                semantic=SurfaceProbeFieldSemantic.DIFFUSE_PRT_L2_SCALAR,
+                semantic=SurfaceProbeFieldSemantic.DIFFUSE_PRT_L2_RGB,
                 coefficient_count=0,
                 channel_count=1,
                 working_storage=SurfaceProbeFieldStorage.FLOAT32,
             )
 
-    def test_prt_l2_field_can_reuse_runtime_without_irradiance_attachments(self):
-        prt_desc = SurfaceProbeFieldDesc(
-            semantic=SurfaceProbeFieldSemantic.DIFFUSE_PRT_L2_SCALAR,
-            coefficient_count=9,
-            channel_count=1,
-            working_storage=SurfaceProbeFieldStorage.FLOAT32,
-        )
+    def test_prt_l2_field_has_rgb_transport_and_static_source_attachment(self):
+        prt_desc = DIFFUSE_PRT_L2_RGB_FIELD
         render_data = _FakeRenderData()
         runtime = SurfaceProbeRuntimeBuffers.acquire(
             render_data,
             11,
             field_desc=prt_desc,
-            attachment_descs=(),
+            attachment_descs=DIFFUSE_PRT_ATTACHMENTS,
         )
-        self.assertEqual(prt_desc.value_stride, 36)
-        self.assertEqual(len(render_data.requests), 2)
-        self.assertEqual(runtime.attachments.buffers, {})
+        self.assertEqual(prt_desc.value_stride, 108)
+        self.assertEqual(prt_desc.bytes_per_probe, 112)
+        self.assertEqual(len(render_data.requests), 5)
+        self.assertIsNotNone(runtime.attachments.static_source_rgb)
 
     def test_runtime_resources_separate_values_counts_and_attachments(self):
         render_data = _FakeRenderData()

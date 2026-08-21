@@ -16,7 +16,7 @@ SURFACE_PROBE_SELF_HIT_SIZE = 4
 
 class SurfaceProbeFieldSemantic(str, Enum):
     DIFFUSE_IRRADIANCE_RGB = "diffuse_irradiance_rgb"
-    DIFFUSE_PRT_L2_SCALAR = "diffuse_prt_l2_scalar"
+    DIFFUSE_PRT_L2_RGB = "diffuse_prt_l2_rgb"
 
 
 class SurfaceProbeFieldStorage(str, Enum):
@@ -31,6 +31,7 @@ class SurfaceProbeFieldStorage(str, Enum):
 class SurfaceProbeAttachmentSemantic(str, Enum):
     SELF_HIT_COUNTS = "self_hit_counts"
     RADIAL_MOMENTS_4X4 = "radial_moments_4x4"
+    STATIC_SOURCE_RGB = "static_source_rgb"
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,12 @@ DIFFUSE_IRRADIANCE_RGB_FIELD = SurfaceProbeFieldDesc(
     channel_count=3,
     working_storage=SurfaceProbeFieldStorage.FLOAT32,
 )
+DIFFUSE_PRT_L2_RGB_FIELD = SurfaceProbeFieldDesc(
+    semantic=SurfaceProbeFieldSemantic.DIFFUSE_PRT_L2_RGB,
+    coefficient_count=9,
+    channel_count=3,
+    working_storage=SurfaceProbeFieldStorage.FLOAT32,
+)
 
 SELF_HIT_COUNTS_ATTACHMENT = SurfaceProbeAttachmentDesc(
     SurfaceProbeAttachmentSemantic.SELF_HIT_COUNTS,
@@ -91,9 +98,18 @@ RADIAL_MOMENTS_4X4_ATTACHMENT = SurfaceProbeAttachmentDesc(
     SurfaceProbeAttachmentSemantic.RADIAL_MOMENTS_4X4,
     SURFACE_PROBE_RADIAL_MOMENT_SIZE,
 )
+STATIC_SOURCE_RGB_ATTACHMENT = SurfaceProbeAttachmentDesc(
+    SurfaceProbeAttachmentSemantic.STATIC_SOURCE_RGB,
+    12,
+)
 DIFFUSE_IRRADIANCE_ATTACHMENTS = (
     SELF_HIT_COUNTS_ATTACHMENT,
     RADIAL_MOMENTS_4X4_ATTACHMENT,
+)
+DIFFUSE_PRT_ATTACHMENTS = (
+    SELF_HIT_COUNTS_ATTACHMENT,
+    RADIAL_MOMENTS_4X4_ATTACHMENT,
+    STATIC_SOURCE_RGB_ATTACHMENT,
 )
 
 
@@ -124,6 +140,12 @@ class SurfaceProbeAttachments:
     def radial_moments(self) -> spy.Buffer:
         return self.require(
             SurfaceProbeAttachmentSemantic.RADIAL_MOMENTS_4X4
+        )
+
+    @property
+    def static_source_rgb(self) -> spy.Buffer:
+        return self.require(
+            SurfaceProbeAttachmentSemantic.STATIC_SOURCE_RGB
         )
 
 

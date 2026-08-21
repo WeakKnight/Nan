@@ -173,6 +173,15 @@ def parse_args() -> argparse.Namespace:
         help="Hemisphere samples traced per surface probe and frame.",
     )
     parser.add_argument(
+        "--surface-probe-field",
+        choices=("irradiance", "prt-l2"),
+        default="irradiance",
+        help=(
+            "Probe payload: evaluated diffuse irradiance or relightable "
+            "L2 RGB precomputed radiance transfer."
+        ),
+    )
+    parser.add_argument(
         "--surface-probe-max-bounces",
         type=int,
         default=3,
@@ -3497,6 +3506,7 @@ def main() -> None:
             oversample_factor=max(1, int(args.surface_probe_oversample)),
             seed=int(args.surface_probe_seed),
             samples_per_probe=max(1, int(args.surface_probe_samples_per_probe)),
+            field_mode=str(args.surface_probe_field),
             max_bounces=max(1, int(args.surface_probe_max_bounces)),
             kernel_radius_scale=max(
                 0.5, float(args.surface_probe_kernel_radius_scale)

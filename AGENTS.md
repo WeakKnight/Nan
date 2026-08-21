@@ -51,7 +51,8 @@
 - `surface_probe_vertex_lighting.py` – Builds an instanced, hard-edge-aware vertex topology graph and projects Surface Probe irradiance into a confidence-weighted screened-diffusion solve before RGBM packing.
 - `surface_probes.py` – Compatible-support pre-analysis, `area*m` allocation, adaptive WSE, budgeted repair, protected zero-count closure, optional vertex anchors, double-sided expansion, and compact per-instance point-octree packing.
 - `surface_probe_resources.py` – Uploads immutable probe placement, instance metadata, point-octrees, and triangle maps as `SurfaceProbeGpuGeometry`; field payloads do not live in this resource.
-- `surface_probe_fields.py` – Declares versioned probe-field semantics/storage plus independently allocated values, sample counts, and optional field attachments. Current consumers use evaluated diffuse RGB; the interface also reserves the L2 scalar PRT semantic.
+- `surface_probe_fields.py` – Declares versioned probe-field semantics/storage plus independently allocated values, sample counts, and optional field attachments. Current fields are evaluated diffuse RGB and L2 RGB PRT with a static-source attachment.
+- `surface_probe_prt.py` – Implements the L2 RGB PRT field baker contract, CPU SH9 reference math, current-sky projection, and GPU evaluation into the common diffuse-RGB field consumed by resolve and Vertex Lighting.
 - `surface_probe_sampler.py` – Lazy CMake build, `ctypes` bindings, validation, and Python references for native weighted sample elimination, deficit repair, and compatible-kernel support estimation.
 - `surface_probe_sampler.cpp`, `surface_probe_sampler.h` – C ABI around the vendored cyCodeBase WSE plus variable-radius adaptive WSE, deterministic global greedy repair, and parallel `f(x)`/`m(x)` estimation. Adaptive initialization is parallel; elimination uses an indexed mutable max-heap and neighbor-owned radii for correct asymmetric updates.
 - `utils.py` – HDR EXR helpers.
@@ -89,6 +90,10 @@
 | `surface_probes.slang` | Field-independent point-octree gather, compact surface kernel, and radial visibility weighting. | Surface-probe passes. |
 | `surface_probe_field.slang` | Common progressive field state, currently the independent per-probe sample-count buffer. | Surface-probe field bakers/consumers. |
 | `surface_probe_irradiance_field.slang` | Diffuse RGB field encoding and weighted reconstruction over geometry gather results. | Surface-probe irradiance passes. |
+| `surface_probe_sh.slang` | Shared real orthonormal L2 SH basis used by PRT baking and current-light projection. | Surface-probe PRT passes. |
+| `surface_probe_prt_field.slang` | L2 RGB transport and static-source residual encoding. | Surface-probe PRT baker/evaluator. |
+| `surface_probe_prt_baker.slang` | Progressively traces RGB transport coefficients while preserving emissive and later-bounce Sun in a static-source residual. | `SurfaceProbePrtBaker`. |
+| `surface_probe_prt_evaluate.slang` | Projects the current atmospheric sky to SH9 and evaluates PRT into the standard diffuse irradiance RGB field. | `SurfaceProbePrtEvaluator`. |
 | `surface_probe_path_tracer.slang` | Progressive irradiance tracing for base, repair, protected, and optional vertex-anchor records. | `SurfaceProbePathTracer`. |
 | `surface_probe_resolve.slang` | Primary-hit visible gather, 2R emergency tier, diagnostics, and optional legacy vertex fallback. | `SurfaceProbeResolve`. |
 | `accumulator.slang` | Temporal accumulation kernel. | Renderer. |
@@ -130,6 +135,7 @@ Include new shaders via `device.load_program(..., ["entry_point"])`; ensure host
 - `test_print.py` + `test_print.slang` demonstrate GPU-side `print` debugging; run the script to verify Slang `print` output and use it as a template for logging thread-local data.
 - GPU crashes: double-check `device` compiler options (`include_paths`, defines) in `app.py`.
 - Native surface-probe sampling defaults to `auto`; use `--surface-probe-sampler-backend cpp` to require the C++ backend or `python` for the reference implementation. The backend controls both WSE and deficit repair; CMake output lives in `surface_probe_sampler_build/`.
+- Surface-probe payload defaults to evaluated RGB irradiance. Use `--surface-probe-field prt-l2` for 9-coefficient RGB PRT plus an RGB static-source residual. Both modes share placement, radial visibility, resolve, and Vertex Lighting; PRT is evaluated into the same RGB consumer field every update.
 - Surface-probe deficit repair runs after the exact-budget WSE base, targets the primary-radius gather count, may append up to `repair_budget_ratio * base_sites`, and never recomputes the base kernel radius.
 - Adaptive surface-probe WSE is enabled by default. Triangle support produces `m=clamp(1/f,1,M)`; base allocation and proposal sampling use `area*m`, while WSE receives the normalized relative density `m/mean(m)` and local radius `r_base/sqrt(relative_density)`. `--surface-probe-no-adaptive-wse` restores the area-only path.
 - Use `--surface-probe-profile-build` to emit flushed startup samples for asset import, Scene GPU/AS creation, adaptive prepass, candidate/WSE, budgeted repair, protected closure, support recomputation, octree packing, GPU upload, and shader initialization.
