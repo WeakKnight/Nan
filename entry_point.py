@@ -130,8 +130,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--surface-probe-count",
         type=int,
-        default=20_480,
-        help="Target surface probe budget used by the surface-probe renderer.",
+        default=None,
+        help=(
+            "Explicit base-site budget override. If omitted, world-space "
+            "density mode determines the population."
+        ),
+    )
+    parser.add_argument(
+        "--surface-probe-density-preset",
+        choices=("ngr-1x",),
+        default="ngr-1x",
+        help=(
+            "Absolute world-space Surface Probe density calibration used "
+            "when --surface-probe-count is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--surface-probe-density-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier for the selected absolute density preset; local "
+            "spacing scales by 1/sqrt(value)."
+        ),
     )
     parser.add_argument(
         "--surface-probe-oversample",
@@ -3464,7 +3485,15 @@ def main() -> None:
         )
     elif args.renderer == "surface-probe":
         renderer = SurfaceProbePathTracingRenderer(
-            target_probe_count=max(1, int(args.surface_probe_count)),
+            target_probe_count=(
+                max(1, int(args.surface_probe_count))
+                if args.surface_probe_count is not None
+                else None
+            ),
+            density_preset=str(args.surface_probe_density_preset),
+            density_scale=max(
+                1.0e-4, float(args.surface_probe_density_scale)
+            ),
             oversample_factor=max(1, int(args.surface_probe_oversample)),
             seed=int(args.surface_probe_seed),
             samples_per_probe=max(1, int(args.surface_probe_samples_per_probe)),

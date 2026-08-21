@@ -5,25 +5,24 @@ import slangpy as spy
 from accumulator import Accumulator
 from render_data import RenderData
 from scene import Scene
-from surface_probe_path_tracer import SurfaceProbePathTracer
+from surface_probe_fields import (
+    DIFFUSE_IRRADIANCE_RGB_FIELD,
+    SURFACE_PROBE_SELF_HIT_SIZE,
+    SurfaceProbeRuntimeBuffers,
+)
+from surface_probe_path_tracer import SurfaceProbeDiffuseIrradianceBaker
 from surface_probe_resolve import SurfaceProbeResolve
+from surface_probe_resources import SurfaceProbeGpuGeometry
 from surface_probe_vertex_lighting import SurfaceProbeVertexLighting
 from surface_probes import (
-    SURFACE_PROBE_PAYLOAD_SIZE,
     SURFACE_PROBE_RADIAL_MOMENT_SIZE,
+    SURFACE_PROBE_NGR_1X_ADAPTIVE_MASS_DENSITY,
+    SURFACE_PROBE_NGR_1X_KERNEL_RADIUS,
     SurfaceProbeLayout,
 )
 from tone_mapper import ToneMapper
 
 
-SURFACE_PROBE_BUFFER_KEY = "surface_probe_renderer.probe_irradiance"
-SURFACE_PROBE_SELF_HIT_BUFFER_KEY = (
-    "surface_probe_renderer.probe_self_hit_counters"
-)
-SURFACE_PROBE_SELF_HIT_SIZE = 4
-SURFACE_PROBE_RADIAL_MOMENT_BUFFER_KEY = (
-    "surface_probe_renderer.probe_radial_moments"
-)
 SURFACE_PROBE_DEBUG_VIEWS = (
     "Beauty",
     "Gather Count",
@@ -34,13 +33,21 @@ SURFACE_PROBE_DEBUG_VIEWS = (
     "Vertex Lighting",
     "Vertex Confidence",
 )
+SURFACE_PROBE_DENSITY_PRESETS = {
+    "ngr-1x": (
+        SURFACE_PROBE_NGR_1X_ADAPTIVE_MASS_DENSITY,
+        SURFACE_PROBE_NGR_1X_KERNEL_RADIUS,
+    ),
+}
 
 
 class SurfaceProbePathTracingRenderer:
     def __init__(
         self,
         *,
-        target_probe_count: int = 20_480,
+        target_probe_count: int | None = None,
+        density_preset: str = "ngr-1x",
+        density_scale: float = 1.0,
         oversample_factor: int = 5,
         seed: int = 1,
         samples_per_probe: int = 1,
@@ -64,7 +71,17 @@ class SurfaceProbePathTracingRenderer:
         vertex_lighting_smoothing_strength: float = 1.0,
         radial_visibility: bool = True,
     ):
-        self.target_probe_count = max(1, int(target_probe_count))
+        self.target_probe_count = (
+            None
+            if target_probe_count is None
+            else max(1, int(target_probe_count))
+        )
+        if density_preset not in SURFACE_PROBE_DENSITY_PRESETS:
+            raise ValueError(
+                f"Unknown surface probe density preset: {density_preset}"
+            )
+        self.density_preset = density_preset
+        self.density_scale = max(1.0e-4, float(density_scale))
         self.oversample_factor = max(1, int(oversample_factor))
         self.seed = int(seed)
         self.samples_per_probe = max(1, int(samples_per_probe))
@@ -127,9 +144,23 @@ class SurfaceProbePathTracingRenderer:
             renderer_profile_samples if self.profile_build else None
         )
         layout_start = time.perf_counter()
+        density_parameters = SURFACE_PROBE_DENSITY_PRESETS[
+            self.density_preset
+        ]
         self.layout = SurfaceProbeLayout.build(
             scene.scene_node,
             target_probe_count=self.target_probe_count,
+            adaptive_mass_site_density=(
+                density_parameters[0]
+                if self.target_probe_count is None
+                else None
+            ),
+            density_reference_kernel_radius=(
+                density_parameters[1]
+                if self.target_probe_count is None
+                else None
+            ),
+            density_scale=self.density_scale,
             oversample_factor=self.oversample_factor,
             seed=self.seed,
             leaf_capacity=self.leaf_capacity,
@@ -146,10 +177,15 @@ class SurfaceProbePathTracingRenderer:
         layout_elapsed = time.perf_counter() - layout_start
         if profile_sink is not None:
             profile_sink.append(("layout_build", layout_elapsed))
-        self.path_tracer = SurfaceProbePathTracer(
+        self.geometry = SurfaceProbeGpuGeometry.create(
+            device,
+            self.layout,
+            profile_sink=profile_sink,
+        )
+        self.field_baker = SurfaceProbeDiffuseIrradianceBaker(
             device,
             scene,
-            self.layout,
+            self.geometry,
             samples_per_probe=self.samples_per_probe,
             max_bounces=self.max_bounces,
             profile_sink=profile_sink,
@@ -157,7 +193,8 @@ class SurfaceProbePathTracingRenderer:
         self.vertex_lighting = SurfaceProbeVertexLighting(
             device,
             scene,
-            self.path_tracer,
+            self.layout,
+            self.geometry,
             defer_layout=not self._build_vertex_lighting_requested,
             profile_sink=profile_sink,
         )
@@ -179,7 +216,7 @@ class SurfaceProbePathTracingRenderer:
             device,
             scene,
             self.layout,
-            self.path_tracer,
+            self.geometry,
             profile_sink=profile_sink,
         )
         self.accumulator = Accumulator(
@@ -236,6 +273,15 @@ class SurfaceProbePathTracingRenderer:
                 time.perf_counter() - profile_report_start
             )
         status_logging_start = time.perf_counter()
+        if self.layout.density_driven:
+            print(
+                "[SurfaceProbeDensity] "
+                f"preset={self.density_preset}; "
+                f"scale={self.layout.density_scale:.3f}; "
+                f"base_sites={self.layout.total_base_surface_site_count:,}; "
+                f"prepass={self.layout.density_prepass_seconds:.3f}s",
+                flush=True,
+            )
         print(
             "[SurfaceProbe] "
             f"{len(self.layout.instance_infos)} instances, "
@@ -250,7 +296,7 @@ class SurfaceProbePathTracingRenderer:
             f"{self.layout.total_probe_count:,} total probes "
             f"(sampler={self.layout.sampler_backend}; "
             f"adaptive_wse={self.layout.adaptive_wse}; "
-            f"{self.layout.total_probe_count * SURFACE_PROBE_PAYLOAD_SIZE / (1024 * 1024):.2f} MiB irradiance; "
+            f"{self.layout.total_probe_count * DIFFUSE_IRRADIANCE_RGB_FIELD.bytes_per_probe / (1024 * 1024):.2f} MiB irradiance field+counts; "
             f"{self.layout.total_probe_count * SURFACE_PROBE_SELF_HIT_SIZE / (1024 * 1024):.2f} MiB self-hit counters; "
             f"{self.layout.total_probe_count * SURFACE_PROBE_RADIAL_MOMENT_SIZE / (1024 * 1024):.2f} MiB radial moments; "
             f"{self.layout.probes.nbytes / (1024 * 1024):.2f} MiB metadata)"
@@ -426,38 +472,18 @@ class SurfaceProbePathTracingRenderer:
                 self._build_vertex_lighting_requested = True
             self._previous_radial_visibility = use_radial_visibility
 
-        probe_irradiance = render_data.get_buffer(
-            SURFACE_PROBE_BUFFER_KEY,
-            usage=spy.BufferUsage.unordered_access
-            | spy.BufferUsage.shader_resource,
-            struct_size=SURFACE_PROBE_PAYLOAD_SIZE,
-            element_count=self.layout.total_probe_count,
-            label="surface_probe_irradiance",
-        )
-        probe_self_hit_counters = render_data.get_buffer(
-            SURFACE_PROBE_SELF_HIT_BUFFER_KEY,
-            usage=spy.BufferUsage.unordered_access
-            | spy.BufferUsage.shader_resource,
-            struct_size=SURFACE_PROBE_SELF_HIT_SIZE,
-            element_count=self.layout.total_probe_count,
-            label="surface_probe_self_hit_counters",
-        )
-        probe_radial_moments = render_data.get_buffer(
-            SURFACE_PROBE_RADIAL_MOMENT_BUFFER_KEY,
-            usage=spy.BufferUsage.unordered_access
-            | spy.BufferUsage.shader_resource,
-            struct_size=SURFACE_PROBE_RADIAL_MOMENT_SIZE,
-            element_count=self.layout.total_probe_count,
-            label="surface_probe_radial_moments",
+        probe_runtime = SurfaceProbeRuntimeBuffers.acquire(
+            render_data,
+            self.layout.total_probe_count,
+            field_desc=DIFFUSE_IRRADIANCE_RGB_FIELD,
         )
 
         if not self._is_paused() or self.reset_probes:
             resetting = self.reset_probes
-            self.path_tracer.execute(
+            self.field_baker.execute(
                 command_encoder,
-                probe_irradiance,
-                probe_self_hit_counters,
-                probe_radial_moments,
+                probe_runtime.field,
+                probe_runtime.attachments,
                 self.probe_iteration,
                 reset=resetting,
             )
@@ -503,8 +529,8 @@ class SurfaceProbePathTracingRenderer:
             vertex_lighting_rgbm = self.vertex_lighting.execute(
                 command_encoder,
                 render_data,
-                probe_irradiance,
-                probe_radial_moments,
+                probe_runtime.field,
+                probe_runtime.attachments,
                 min_gather_count=self.repair_min_gather,
                 smoothing_passes=smoothing_passes,
                 regularization_strength=regularization_strength,
@@ -551,9 +577,8 @@ class SurfaceProbePathTracingRenderer:
         )
         self.resolve.execute(
             command_encoder,
-            probe_irradiance,
-            probe_self_hit_counters,
-            probe_radial_moments,
+            probe_runtime.field,
+            probe_runtime.attachments,
             resolve_texture,
             debug_view=debug_view,
             min_gather_count=self.repair_min_gather,
@@ -620,7 +645,13 @@ class SurfaceProbePathTracingRenderer:
                 f"sites: {self.layout.total_base_surface_site_count:,} + "
                 f"{self.layout.total_repair_surface_site_count:,} repair; "
                 f"{self.layout.total_protected_surface_site_count:,} protected; "
-                f"vertex anchors: "
+                + (
+                    f"density: {self.density_preset} "
+                    f"{self.layout.density_scale:.2f}x; "
+                    if self.layout.density_driven
+                    else "density: explicit-count; "
+                )
+                + f"vertex anchors: "
                 f"{self.layout.total_vertex_anchor_site_count:,}; "
                 f"probes: {self.layout.total_probe_count:,}"
                 "; probe cache: indirect + sky, sun direct: realtime"

@@ -1,7 +1,10 @@
 import common;
 import surface_probes;
+import surface_probe_field;
+import surface_probe_irradiance_field;
 
-ByteAddressBuffer g_probe_irradiance;
+ByteAddressBuffer g_probe_field_values;
+ByteAddressBuffer g_probe_sample_counts;
 ByteAddressBuffer g_probe_radial_moments;
 StructuredBuffer<SurfaceProbe> g_surface_probes;
 StructuredBuffer<uint4> g_surface_probe_nodes;
@@ -61,11 +64,12 @@ float3 vertex_lighting_spatial_gather(
     {
         candidate_weights[candidate] *= surface_probe_radial_visibility(
             g_probe_radial_moments,
-            g_probe_irradiance,
             g_surface_probes,
             candidate_indices[candidate],
             query_position,
             instance_info.params.x,
+            surface_probe_load_sample_count(
+                g_probe_sample_counts, candidate_indices[candidate]),
             g_use_radial_visibility);
     }
     surface_probe_select_strongest(
@@ -104,11 +108,12 @@ float3 vertex_lighting_spatial_gather(
         {
             candidate_weights[candidate] *= surface_probe_radial_visibility(
                 g_probe_radial_moments,
-                g_probe_irradiance,
                 g_surface_probes,
                 candidate_indices[candidate],
                 query_position,
                 instance_info.params.x,
+                surface_probe_load_sample_count(
+                    g_probe_sample_counts, candidate_indices[candidate]),
                 g_use_radial_visibility);
         }
         surface_probe_select_strongest(
@@ -132,7 +137,8 @@ float3 vertex_lighting_spatial_gather(
     float weight_sum;
     float ess;
     float3 irradiance = surface_probe_reconstruct_irradiance(
-        g_probe_irradiance,
+        g_probe_field_values,
+        g_probe_sample_counts,
         g_surface_probes,
         gathered_count,
         gathered_indices,
@@ -170,12 +176,12 @@ void gather_main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         float coverage_weight = max(asfloat(sample.z), 0.0);
         total_weight += coverage_weight;
         if (surface_probe_load_sample_count(
-                g_probe_irradiance, sample.x) == 0)
+                g_probe_sample_counts, sample.x) == 0)
         {
             continue;
         }
         float3 sample_irradiance = surface_probe_load_irradiance(
-            g_probe_irradiance, sample.x);
+            g_probe_field_values, sample.x);
         weighted_irradiance += weight * sample_irradiance;
         float sample_luma = dot(
             sample_irradiance, float3(0.2126, 0.7152, 0.0722));

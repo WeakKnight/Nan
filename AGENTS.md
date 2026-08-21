@@ -50,6 +50,8 @@
 - `mesh_colors_rgb9e5.py` – GPU wrapper that packs filtered float irradiance into one RGB9E5 `uint` per payload.
 - `surface_probe_vertex_lighting.py` – Builds an instanced, hard-edge-aware vertex topology graph and projects Surface Probe irradiance into a confidence-weighted screened-diffusion solve before RGBM packing.
 - `surface_probes.py` – Compatible-support pre-analysis, `area*m` allocation, adaptive WSE, budgeted repair, protected zero-count closure, optional vertex anchors, double-sided expansion, and compact per-instance point-octree packing.
+- `surface_probe_resources.py` – Uploads immutable probe placement, instance metadata, point-octrees, and triangle maps as `SurfaceProbeGpuGeometry`; field payloads do not live in this resource.
+- `surface_probe_fields.py` – Declares versioned probe-field semantics/storage plus independently allocated values, sample counts, and optional field attachments. Current consumers use evaluated diffuse RGB; the interface also reserves the L2 scalar PRT semantic.
 - `surface_probe_sampler.py` – Lazy CMake build, `ctypes` bindings, validation, and Python references for native weighted sample elimination, deficit repair, and compatible-kernel support estimation.
 - `surface_probe_sampler.cpp`, `surface_probe_sampler.h` – C ABI around the vendored cyCodeBase WSE plus variable-radius adaptive WSE, deterministic global greedy repair, and parallel `f(x)`/`m(x)` estimation. Adaptive initialization is parallel; elimination uses an indexed mutable max-heap and neighbor-owned radii for correct asymmetric updates.
 - `utils.py` – HDR EXR helpers.
@@ -84,7 +86,9 @@
 | `mesh_colors_rgb9e5_pack.slang` | Packs writable float3 irradiance into a 32-bit shared-exponent RGB9E5 payload. | `MeshColorsRGB9E5Packer`. |
 | `surface_probe_vertex_lighting.slang` | Gathers the indirect-only Surface Probe cache at render vertices, performs topology-aware screened diffusion, and packs one RGBM `uint` per instance vertex. Direct sun is evaluated in the preview resolve. | `SurfaceProbeVertexLighting`. |
 | `mesh_colors_frozen_resolve.slang` | Primary-ray lookup from a read-only RGB9E5 irradiance buffer. | `MeshColorsResolve`. |
-| `surface_probes.slang` | Point-octree gather, compact surface kernel, and irradiance reconstruction. | Surface-probe passes. |
+| `surface_probes.slang` | Field-independent point-octree gather, compact surface kernel, and radial visibility weighting. | Surface-probe passes. |
+| `surface_probe_field.slang` | Common progressive field state, currently the independent per-probe sample-count buffer. | Surface-probe field bakers/consumers. |
+| `surface_probe_irradiance_field.slang` | Diffuse RGB field encoding and weighted reconstruction over geometry gather results. | Surface-probe irradiance passes. |
 | `surface_probe_path_tracer.slang` | Progressive irradiance tracing for base, repair, protected, and optional vertex-anchor records. | `SurfaceProbePathTracer`. |
 | `surface_probe_resolve.slang` | Primary-hit visible gather, 2R emergency tier, diagnostics, and optional legacy vertex fallback. | `SurfaceProbeResolve`. |
 | `accumulator.slang` | Temporal accumulation kernel. | Renderer. |

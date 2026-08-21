@@ -10,7 +10,12 @@ import slangpy as spy
 from render_data import RenderData
 from scene import Scene
 from scene_node import SceneNode
-from surface_probe_path_tracer import SurfaceProbePathTracer
+from surface_probe_fields import (
+    DIFFUSE_IRRADIANCE_RGB_FIELD,
+    SurfaceProbeAttachments,
+    SurfaceProbeFieldBuffers,
+)
+from surface_probe_resources import SurfaceProbeGpuGeometry
 from surface_probes import (
     SURFACE_PROBE_FLAG_BACK_SIDE,
     SURFACE_PROBE_FLAG_VERTEX_ANCHOR,
@@ -667,14 +672,16 @@ class SurfaceProbeVertexLighting:
         self,
         device: spy.Device,
         scene: Scene,
-        path_tracer: SurfaceProbePathTracer,
+        probe_layout: SurfaceProbeLayout,
+        probe_geometry: SurfaceProbeGpuGeometry,
         *,
         defer_layout: bool = False,
         profile_sink: list[tuple[str, float]] | None = None,
     ):
         self.device = device
         self.scene = scene
-        self.path_tracer = path_tracer
+        self.probe_layout = probe_layout
+        self.probe_geometry = probe_geometry
         self.gather_pipeline = device.create_compute_pipeline(
             device.load_program(
                 "surface_probe_vertex_lighting.slang", ["gather_main"]
@@ -759,7 +766,7 @@ class SurfaceProbeVertexLighting:
         start = time.perf_counter()
         self.layout = VertexLightingLayout.build(
             self.scene.scene_node,
-            probe_layout=self.path_tracer.layout,
+            probe_layout=self.probe_layout,
         )
         if profile_sink is not None:
             profile_sink.append(
@@ -854,8 +861,8 @@ class SurfaceProbeVertexLighting:
         self,
         command_encoder: spy.CommandEncoder,
         render_data: RenderData,
-        probe_irradiance: spy.Buffer,
-        probe_radial_moments: spy.Buffer,
+        field: SurfaceProbeFieldBuffers,
+        attachments: SurfaceProbeAttachments,
         *,
         min_gather_count: int,
         smoothing_passes: int,
@@ -863,6 +870,11 @@ class SurfaceProbeVertexLighting:
         rgbm_range: float,
         use_radial_visibility: bool = True,
     ) -> spy.Buffer:
+        if field.desc != DIFFUSE_IRRADIANCE_RGB_FIELD:
+            raise ValueError(
+                "Vertex Lighting currently consumes evaluated diffuse "
+                "irradiance RGB"
+            )
         layout = self.ensure_layout()
         target = self.target_buffer(render_data)
         work_a = self._buffer(
@@ -880,13 +892,12 @@ class SurfaceProbeVertexLighting:
         with command_encoder.begin_compute_pass() as pass_encoder:
             shader = pass_encoder.bind_pipeline(self.gather_pipeline)
             cursor = spy.ShaderCursor(shader)
-            cursor.g_probe_irradiance = probe_irradiance
-            cursor.g_probe_radial_moments = probe_radial_moments
-            cursor.g_surface_probes = self.path_tracer.probe_buffer
-            cursor.g_surface_probe_nodes = self.path_tracer.node_buffer
-            cursor.g_surface_probe_instances = (
-                self.path_tracer.instance_buffer
-            )
+            cursor.g_probe_field_values = field.values
+            cursor.g_probe_sample_counts = field.sample_counts
+            cursor.g_probe_radial_moments = attachments.radial_moments
+            cursor.g_surface_probes = self.probe_geometry.probes
+            cursor.g_surface_probe_nodes = self.probe_geometry.nodes
+            cursor.g_surface_probe_instances = self.probe_geometry.instances
             cursor.g_projection_offsets = self.projection_offsets_buffer
             cursor.g_projection_samples = self.projection_samples_buffer
             cursor.g_vertex_meta = self.vertex_meta_buffer

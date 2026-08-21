@@ -12,6 +12,7 @@ from surface_probes import (
     SURFACE_PROBE_RADIAL_DEPTH_DIM,
     SURFACE_PROBE_RADIAL_MOMENT_SIZE,
     SurfaceProbeLayout,
+    _allocate_density_counts,
     _build_point_octree_python,
     adaptive_weighted_sample_elimination,
     surface_probe_hemi_oct_decode,
@@ -53,6 +54,41 @@ class SurfaceProbeRendererConfigurationTests(unittest.TestCase):
                 "Vertex Confidence",
             ),
         )
+
+    def test_renderer_defaults_to_absolute_density(self):
+        renderer = SurfaceProbePathTracingRenderer()
+        self.assertIsNone(renderer.target_probe_count)
+        self.assertEqual(renderer.density_preset, "ngr-1x")
+        self.assertEqual(renderer.density_scale, 1.0)
+
+    def test_explicit_count_remains_an_override(self):
+        renderer = SurfaceProbePathTracingRenderer(
+            target_probe_count=37_000
+        )
+        self.assertEqual(renderer.target_probe_count, 37_000)
+
+
+class SurfaceProbeDensityAllocationTests(unittest.TestCase):
+    def test_absolute_density_is_not_globally_normalized(self):
+        counts = _allocate_density_counts(
+            np.asarray([1.0, 2.0, 4.0], dtype=np.float64),
+            10.0,
+            minimum_per_entry=4,
+        )
+        np.testing.assert_array_equal(counts, [14, 24, 44])
+        doubled = _allocate_density_counts(
+            np.asarray([1.0, 2.0, 4.0], dtype=np.float64),
+            20.0,
+            minimum_per_entry=4,
+        )
+        np.testing.assert_array_equal(doubled, [24, 44, 84])
+
+    def test_invalid_density_is_rejected(self):
+        with self.assertRaises(ValueError):
+            _allocate_density_counts(
+                np.asarray([1.0], dtype=np.float64),
+                0.0,
+            )
 
 
 class SurfaceProbeRadialDepthTests(unittest.TestCase):
@@ -849,6 +885,33 @@ class SurfaceProbeLayoutTests(unittest.TestCase):
                 >> SURFACE_PROBE_INSTANCE_SHIFT
             )
             self.assertTrue(np.all(packed_instances == instance_index))
+
+    def test_density_mode_makes_base_population_an_output(self):
+        density_layout = SurfaceProbeLayout.build(
+            self.scene_node,
+            target_probe_count=None,
+            adaptive_mass_site_density=0.5,
+            density_reference_kernel_radius=2.5,
+            density_scale=1.0,
+            oversample_factor=1,
+            seed=7,
+            repair_budget_ratio=0.0,
+        )
+        self.assertTrue(density_layout.density_driven)
+        self.assertEqual(density_layout.density_scale, 1.0)
+        self.assertGreater(density_layout.total_surface_area, 0.0)
+        self.assertGreater(density_layout.total_adaptive_mass, 0.0)
+        self.assertGreaterEqual(
+            density_layout.total_base_surface_site_count,
+            4 * len(density_layout.instance_infos),
+        )
+        self.assertEqual(
+            density_layout.total_base_surface_site_count,
+            sum(
+                info.base_surface_site_count
+                for info in density_layout.instance_infos
+            ),
+        )
 
     def test_compact_octree_ranges_are_valid(self):
         for info in self.layout.instance_infos:

@@ -1,9 +1,12 @@
 import common;
 import scene;
 import surface_probes;
+import surface_probe_field;
+import surface_probe_irradiance_field;
 
 RWTexture2D<float4> g_output;
-ByteAddressBuffer g_probe_irradiance;
+ByteAddressBuffer g_probe_field_values;
+ByteAddressBuffer g_probe_sample_counts;
 ByteAddressBuffer g_probe_self_hit_counters;
 ByteAddressBuffer g_probe_radial_moments;
 StructuredBuffer<SurfaceProbe> g_surface_probes;
@@ -145,11 +148,12 @@ float3 surface_probe_sample_irradiance(
     {
         candidate_weights[candidate] *= surface_probe_radial_visibility(
             g_probe_radial_moments,
-            g_probe_irradiance,
             g_surface_probes,
             candidate_indices[candidate],
             query_position,
             instance_info.params.x,
+            surface_probe_load_sample_count(
+                g_probe_sample_counts, candidate_indices[candidate]),
             g_use_radial_visibility);
     }
     surface_probe_select_strongest(
@@ -188,11 +192,12 @@ float3 surface_probe_sample_irradiance(
         {
             candidate_weights[candidate] *= surface_probe_radial_visibility(
                 g_probe_radial_moments,
-                g_probe_irradiance,
                 g_surface_probes,
                 candidate_indices[candidate],
                 query_position,
                 instance_info.params.x,
+                surface_probe_load_sample_count(
+                    g_probe_sample_counts, candidate_indices[candidate]),
                 g_use_radial_visibility);
         }
         surface_probe_select_strongest(
@@ -218,7 +223,7 @@ float3 surface_probe_sample_irradiance(
     {
         uint probe_index = gathered_indices[i];
         uint sample_count = surface_probe_load_sample_count(
-            g_probe_irradiance, probe_index);
+            g_probe_sample_counts, probe_index);
         if (sample_count == 0u)
             continue;
         float rate = float(surface_probe_load_self_hit_count(
@@ -231,7 +236,8 @@ float3 surface_probe_sample_irradiance(
         : 0.0;
 
     return surface_probe_reconstruct_irradiance(
-        g_probe_irradiance,
+        g_probe_field_values,
+        g_probe_sample_counts,
         g_surface_probes,
         gathered_count,
         gathered_indices,
@@ -265,13 +271,13 @@ bool surface_probe_sample_vertex_fallback(
     {
         uint probe_index = indices[corner];
         if (surface_probe_load_sample_count(
-                g_probe_irradiance, probe_index) == 0)
+                g_probe_sample_counts, probe_index) == 0)
         {
             continue;
         }
         float weight = barycentrics[corner];
         accumulated += weight * surface_probe_load_irradiance(
-            g_probe_irradiance, probe_index);
+            g_probe_field_values, probe_index);
         available_weight += weight;
     }
     if (available_weight <= 1e-6)

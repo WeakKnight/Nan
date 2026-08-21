@@ -3,7 +3,12 @@ import time
 import slangpy as spy
 
 from scene import Scene
-from surface_probe_path_tracer import SurfaceProbePathTracer
+from surface_probe_fields import (
+    DIFFUSE_IRRADIANCE_RGB_FIELD,
+    SurfaceProbeAttachments,
+    SurfaceProbeFieldBuffers,
+)
+from surface_probe_resources import SurfaceProbeGpuGeometry
 from surface_probes import SurfaceProbeLayout
 from surface_probe_vertex_lighting import SurfaceProbeVertexLighting
 
@@ -14,14 +19,14 @@ class SurfaceProbeResolve:
         device: spy.Device,
         scene: Scene,
         layout: SurfaceProbeLayout,
-        path_tracer: SurfaceProbePathTracer,
+        geometry: SurfaceProbeGpuGeometry,
         *,
         profile_sink: list[tuple[str, float]] | None = None,
     ):
         self.device = device
         self.scene = scene
         self.layout = layout
-        self.path_tracer = path_tracer
+        self.geometry = geometry
         stage_start = time.perf_counter() if profile_sink is not None else 0.0
         self.program = device.load_program(
             "surface_probe_resolve.slang", ["compute_main"]
@@ -39,9 +44,8 @@ class SurfaceProbeResolve:
     def execute(
         self,
         command_encoder: spy.CommandEncoder,
-        probe_irradiance: spy.Buffer,
-        probe_self_hit_counters: spy.Buffer,
-        probe_radial_moments: spy.Buffer,
+        field: SurfaceProbeFieldBuffers,
+        attachments: SurfaceProbeAttachments,
         output: spy.Texture,
         *,
         debug_view: int = 0,
@@ -53,18 +57,24 @@ class SurfaceProbeResolve:
         use_vertex_lighting: bool = False,
         use_radial_visibility: bool = True,
     ) -> None:
+        if field.desc != DIFFUSE_IRRADIANCE_RGB_FIELD:
+            raise ValueError(
+                "SurfaceProbeResolve currently consumes evaluated diffuse "
+                "irradiance RGB"
+            )
         with command_encoder.begin_compute_pass() as pass_encoder:
             shader_object = pass_encoder.bind_pipeline(self.pipeline)
             cursor = spy.ShaderCursor(shader_object)
             cursor.g_output = output
-            cursor.g_probe_irradiance = probe_irradiance
-            cursor.g_probe_self_hit_counters = probe_self_hit_counters
-            cursor.g_probe_radial_moments = probe_radial_moments
-            cursor.g_surface_probes = self.path_tracer.probe_buffer
-            cursor.g_surface_probe_nodes = self.path_tracer.node_buffer
-            cursor.g_surface_probe_instances = self.path_tracer.instance_buffer
+            cursor.g_probe_field_values = field.values
+            cursor.g_probe_sample_counts = field.sample_counts
+            cursor.g_probe_self_hit_counters = attachments.self_hit_counts
+            cursor.g_probe_radial_moments = attachments.radial_moments
+            cursor.g_surface_probes = self.geometry.probes
+            cursor.g_surface_probe_nodes = self.geometry.nodes
+            cursor.g_surface_probe_instances = self.geometry.instances
             cursor.g_triangle_vertex_probes = (
-                self.path_tracer.triangle_vertex_probe_buffer
+                self.geometry.triangle_vertex_probes
             )
             if (
                 vertex_lighting is None

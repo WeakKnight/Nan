@@ -14,7 +14,6 @@ struct SurfaceProbeInstanceInfo
     float4 params;
 };
 
-static const uint SURFACE_PROBE_PAYLOAD_STRIDE = 16;
 static const uint SURFACE_PROBE_SELF_HIT_STRIDE = 4;
 static const uint SURFACE_PROBE_RADIAL_DEPTH_DIM = 4;
 static const uint SURFACE_PROBE_RADIAL_TEXEL_COUNT =
@@ -66,42 +65,6 @@ uint surface_probe_instance_index(SurfaceProbe probe)
 float surface_probe_support_f(SurfaceProbe probe)
 {
     return saturate(probe.normal_side.w);
-}
-
-float3 surface_probe_load_irradiance(
-    ByteAddressBuffer buffer,
-    uint probe_index)
-{
-    uint offset = probe_index * SURFACE_PROBE_PAYLOAD_STRIDE;
-    return asfloat(uint3(
-        buffer.Load(offset),
-        buffer.Load(offset + 4),
-        buffer.Load(offset + 8)));
-}
-
-float3 surface_probe_load_irradiance(
-    RWByteAddressBuffer buffer,
-    uint probe_index)
-{
-    uint offset = probe_index * SURFACE_PROBE_PAYLOAD_STRIDE;
-    return asfloat(uint3(
-        buffer.Load(offset),
-        buffer.Load(offset + 4),
-        buffer.Load(offset + 8)));
-}
-
-uint surface_probe_load_sample_count(
-    ByteAddressBuffer buffer,
-    uint probe_index)
-{
-    return buffer.Load(probe_index * SURFACE_PROBE_PAYLOAD_STRIDE + 12);
-}
-
-uint surface_probe_load_sample_count(
-    RWByteAddressBuffer buffer,
-    uint probe_index)
-{
-    return buffer.Load(probe_index * SURFACE_PROBE_PAYLOAD_STRIDE + 12);
 }
 
 uint surface_probe_load_self_hit_count(
@@ -532,11 +495,11 @@ float surface_probe_chebyshev_visibility(
 
 float surface_probe_radial_visibility(
     ByteAddressBuffer radial_moments,
-    ByteAddressBuffer irradiance,
     StructuredBuffer<SurfaceProbe> probes,
     uint probe_index,
     float3 query_position,
     float kernel_radius,
+    uint sample_count,
     uint enabled)
 {
     if (enabled == 0u)
@@ -563,65 +526,10 @@ float surface_probe_radial_visibility(
         moments,
         normalized_distance);
     float temporal_confidence = saturate(
-        float(surface_probe_load_sample_count(irradiance, probe_index))
-        / 32.0);
+        float(sample_count) / 32.0);
     // This is deliberately a soft prior, not a binary visibility decision.
     return lerp(
         1.0,
         visibility,
         0.75 * temporal_confidence);
-}
-
-float3 surface_probe_reconstruct_irradiance(
-    ByteAddressBuffer irradiance,
-    StructuredBuffer<SurfaceProbe> probes,
-    uint gathered_count,
-    uint gathered_indices[SURFACE_PROBE_MAX_GATHER],
-    float gathered_weights[SURFACE_PROBE_MAX_GATHER],
-    out float support_f,
-    out float reconstruction_weight_sum,
-    out float reconstruction_ess)
-{
-    float3 accumulated = float3(0.0);
-    float weight_sum = 0.0;
-    float weight_square_sum = 0.0;
-    float support_sum = 0.0;
-    float support_weight_sum = 0.0;
-    float best_weight = -1.0;
-    float3 best_irradiance = float3(0.0);
-    for (uint i = 0; i < gathered_count; i++)
-    {
-        SurfaceProbe probe = surface_probe_load(
-            probes, gathered_indices[i]);
-        support_sum += gathered_weights[i] * surface_probe_support_f(probe);
-        support_weight_sum += gathered_weights[i];
-        float3 probe_irradiance = surface_probe_load_irradiance(
-            irradiance, gathered_indices[i]);
-        uint sample_count = surface_probe_load_sample_count(
-            irradiance, gathered_indices[i]);
-        float confidence = sample_count > 0 ? 1.0 : 0.0;
-        float weight = gathered_weights[i] * confidence;
-        accumulated += weight * probe_irradiance;
-        weight_sum += weight;
-        weight_square_sum += weight * weight;
-        if (weight > best_weight)
-        {
-            best_weight = weight;
-            best_irradiance = probe_irradiance;
-        }
-    }
-
-    support_f = support_weight_sum > 1e-6
-        ? saturate(support_sum / support_weight_sum)
-        : 0.0;
-    reconstruction_weight_sum = weight_sum;
-    reconstruction_ess = weight_square_sum > 1e-12
-        ? weight_sum * weight_sum / weight_square_sum
-        : 0.0;
-
-    if (weight_sum > 1e-6)
-        return accumulated / weight_sum;
-    if (best_weight >= 0.0)
-        return best_irradiance;
-    return float3(0.0);
 }

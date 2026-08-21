@@ -13,21 +13,28 @@ import numpy.typing as npt
 import slangpy as spy
 
 from scene_node import SceneNode
-
-
-SURFACE_PROBE_PAYLOAD_SIZE = 16
-SURFACE_PROBE_METADATA_SIZE = 48
-SURFACE_PROBE_NODE_SIZE = 16
-SURFACE_PROBE_INSTANCE_SIZE = 48
-SURFACE_PROBE_RADIAL_DEPTH_DIM = 4
-SURFACE_PROBE_RADIAL_MOMENT_SIZE = (
-    SURFACE_PROBE_RADIAL_DEPTH_DIM * SURFACE_PROBE_RADIAL_DEPTH_DIM * 4
+from surface_probe_resources import (
+    SURFACE_PROBE_INSTANCE_SIZE,
+    SURFACE_PROBE_METADATA_SIZE,
+    SURFACE_PROBE_NODE_SIZE,
+    SURFACE_PROBE_RADIAL_DEPTH_DIM,
+    SURFACE_PROBE_RADIAL_MOMENT_SIZE,
 )
+
+
 SURFACE_PROBE_FLAG_BACK_SIDE = 1 << 0
 SURFACE_PROBE_FLAG_VERTEX_ANCHOR = 1 << 1
 SURFACE_PROBE_FLAG_PROTECTED = 1 << 2
 SURFACE_PROBE_INSTANCE_SHIFT = 8
 SURFACE_PROBE_HARD_NORMAL_COSINE = math.cos(math.radians(80.0))
+
+# Absolute-density calibration from
+# F:\NGRExport\BakingTest\NGR_EastWorld1.gltf loaded with App's 0.1 scale.
+# The reference 1M layout has a 0.0705348 world-unit support/kernel floor.
+# Counts reserve four sites per valid instance, then allocate the remaining
+# population per unit of adaptive mass integral(area * m(x)).
+SURFACE_PROBE_NGR_1X_KERNEL_RADIUS = 0.070534791366
+SURFACE_PROBE_NGR_1X_ADAPTIVE_MASS_DENSITY = 868.163904068
 
 SurfaceProbeSamplerBackend = Literal["auto", "cpp", "python"]
 _cpp_sampler_fallback_warning_printed = False
@@ -284,6 +291,37 @@ def _allocate_counts(
         order = np.argsort(-(expected - extra), kind="stable")
         result[order[:remainder]] += 1
     return result
+
+
+def _allocate_density_counts(
+    weights: npt.NDArray[np.float64],
+    density: float,
+    *,
+    minimum_per_entry: int = 1,
+) -> np.ndarray:
+    """Deterministically convert absolute weighted area into site counts.
+
+    Unlike `_allocate_counts`, this does not normalize against a global
+    population. The total is therefore an output of world-space density.
+    """
+    weight_array = np.asarray(weights, dtype=np.float64)
+    if weight_array.ndim != 1:
+        raise ValueError("Density allocation weights must be one-dimensional")
+    if not np.all(np.isfinite(weight_array) & (weight_array >= 0.0)):
+        raise ValueError(
+            "Density allocation weights must be finite and non-negative"
+        )
+    density = float(density)
+    if not math.isfinite(density) or density <= 0.0:
+        raise ValueError("Surface probe density must be finite and positive")
+    minimum_per_entry = max(1, int(minimum_per_entry))
+    expected_extra = weight_array * density
+    if np.any(expected_extra > np.iinfo(np.int64).max - minimum_per_entry):
+        raise OverflowError("Surface probe density exceeds int64 count range")
+    # Round to nearest with an explicit half-up rule so the result does not
+    # inherit NumPy's bankers-rounding behavior.
+    extra = np.floor(expected_extra + 0.5).astype(np.int64)
+    return extra + np.int64(minimum_per_entry)
 
 
 def _transform_positions(
@@ -1479,6 +1517,13 @@ class SurfaceProbeLayout:
     density_m_p95: float
     max_density_multiplier: float
     adaptive_wse: bool
+    density_driven: bool
+    density_scale: float
+    adaptive_mass_site_density: float
+    density_reference_kernel_radius: float
+    total_surface_area: float
+    total_adaptive_mass: float
+    density_prepass_seconds: float
     total_probe_count: int
     total_vertex_anchor_site_count: int
     total_vertex_anchor_probe_count: int
@@ -1492,7 +1537,10 @@ class SurfaceProbeLayout:
         cls,
         scene_node: SceneNode,
         *,
-        target_probe_count: int = 8_192,
+        target_probe_count: int | None = 8_192,
+        adaptive_mass_site_density: float | None = None,
+        density_reference_kernel_radius: float | None = None,
+        density_scale: float = 1.0,
         oversample_factor: int = 5,
         seed: int = 1,
         leaf_capacity: int = 8,
@@ -1524,7 +1572,66 @@ class SurfaceProbeLayout:
                     flush=True,
                 )
 
-        target_probe_count = max(1, int(target_probe_count))
+        density_driven = (
+            adaptive_mass_site_density is not None
+            or density_reference_kernel_radius is not None
+        )
+        if density_driven:
+            if (
+                adaptive_mass_site_density is None
+                or density_reference_kernel_radius is None
+            ):
+                raise ValueError(
+                    "Density-driven surface probes require both adaptive mass "
+                    "density and a reference kernel radius"
+                )
+            if target_probe_count is not None:
+                raise ValueError(
+                    "Explicit surface probe count and density mode are "
+                    "mutually exclusive"
+                )
+            density_scale = float(density_scale)
+            adaptive_mass_site_density = float(adaptive_mass_site_density)
+            density_reference_kernel_radius = float(
+                density_reference_kernel_radius
+            )
+            if not math.isfinite(density_scale) or density_scale <= 0.0:
+                raise ValueError(
+                    "Surface probe density scale must be finite and positive"
+                )
+            if (
+                not math.isfinite(adaptive_mass_site_density)
+                or adaptive_mass_site_density <= 0.0
+            ):
+                raise ValueError(
+                    "Adaptive-mass site density must be finite and positive"
+                )
+            if (
+                not math.isfinite(density_reference_kernel_radius)
+                or density_reference_kernel_radius <= 0.0
+            ):
+                raise ValueError(
+                    "Density reference kernel radius must be finite and "
+                    "positive"
+                )
+            effective_adaptive_mass_density = (
+                adaptive_mass_site_density * density_scale
+            )
+            effective_reference_kernel_radius = (
+                density_reference_kernel_radius / math.sqrt(density_scale)
+            )
+            target_probe_count = 0
+        else:
+            if target_probe_count is None:
+                raise ValueError(
+                    "Surface probes require an explicit count or density mode"
+                )
+            target_probe_count = max(1, int(target_probe_count))
+            density_scale = 1.0
+            adaptive_mass_site_density = 0.0
+            density_reference_kernel_radius = 0.0
+            effective_adaptive_mass_density = 0.0
+            effective_reference_kernel_radius = 0.0
         oversample_factor = max(1, int(oversample_factor))
         leaf_capacity = max(1, int(leaf_capacity))
         max_depth = max(1, int(max_depth))
@@ -1562,20 +1669,41 @@ class SurfaceProbeLayout:
         profile_mark("collect_geometry")
 
         area_array = np.asarray(areas, dtype=np.float64)
-        global_spacing = math.sqrt(
-            max(float(np.sum(area_array)), 1e-20) / target_probe_count
-        )
-        global_kernel_radius = max(
-            global_spacing * kernel_radius_scale, 1e-5
-        )
-        preliminary_target_counts = _allocate_counts(
-            area_array,
-            target_probe_count,
-            minimum_per_entry=min(
-                repair_min_gather,
-                max(1, target_probe_count // len(valid_instance_indices)),
-            ),
-        )
+        total_surface_area = max(float(np.sum(area_array)), 1e-20)
+        if density_driven:
+            global_kernel_radius = max(
+                effective_reference_kernel_radius, 1e-5
+            )
+            reference_spacing = (
+                global_kernel_radius / kernel_radius_scale
+            )
+            preliminary_area_density = 1.0 / max(
+                reference_spacing * reference_spacing, 1e-20
+            )
+            preliminary_target_counts = _allocate_density_counts(
+                area_array,
+                preliminary_area_density,
+                minimum_per_entry=repair_min_gather,
+            )
+        else:
+            global_spacing = math.sqrt(
+                total_surface_area / target_probe_count
+            )
+            global_kernel_radius = max(
+                global_spacing * kernel_radius_scale, 1e-5
+            )
+            preliminary_target_counts = _allocate_counts(
+                area_array,
+                target_probe_count,
+                minimum_per_entry=min(
+                    repair_min_gather,
+                    max(
+                        1,
+                        target_probe_count // len(valid_instance_indices),
+                    ),
+                ),
+            )
+        density_prepass_origin = time.perf_counter()
         adaptive_prepasses: list[_AdaptiveInstancePrepass] = []
         adaptive_prepass_cache: dict[
             tuple[tuple[int, tuple[float, ...]], int],
@@ -1703,19 +1831,48 @@ class SurfaceProbeLayout:
                     adaptive_mass=adaptive_mass,
                 )
             )
+        density_prepass_seconds = time.perf_counter() - density_prepass_origin
         profile_mark("adaptive_support_prepass")
 
-        target_counts = _allocate_counts(
-            np.asarray(
-                [state.adaptive_mass for state in adaptive_prepasses],
-                dtype=np.float64,
-            ),
-            target_probe_count,
-            minimum_per_entry=min(
-                repair_min_gather,
-                max(1, target_probe_count // len(valid_instance_indices)),
-            ),
+        adaptive_mass_array = np.asarray(
+            [state.adaptive_mass for state in adaptive_prepasses],
+            dtype=np.float64,
         )
+        total_adaptive_mass = float(
+            np.sum(adaptive_mass_array, dtype=np.float64)
+        )
+        if density_driven:
+            target_counts = _allocate_density_counts(
+                adaptive_mass_array,
+                effective_adaptive_mass_density,
+                minimum_per_entry=repair_min_gather,
+            )
+            target_probe_count = int(
+                np.sum(target_counts, dtype=np.int64)
+            )
+            print(
+                "[SurfaceProbeDensity] "
+                f"mode=absolute; scale={density_scale:.3f}; "
+                f"surface_area={total_surface_area:.6f}; "
+                f"adaptive_mass={total_adaptive_mass:.6f}; "
+                f"mass_density={effective_adaptive_mass_density:.6f}; "
+                f"reference_radius={global_kernel_radius:.6f}; "
+                f"base_sites={target_probe_count:,}; "
+                f"prepass={density_prepass_seconds:.3f}s",
+                flush=True,
+            )
+        else:
+            target_counts = _allocate_counts(
+                adaptive_mass_array,
+                target_probe_count,
+                minimum_per_entry=min(
+                    repair_min_gather,
+                    max(
+                        1,
+                        target_probe_count // len(valid_instance_indices),
+                    ),
+                ),
+            )
         build_states: list[_InstanceBuildState] = []
         total_candidates = 0
         candidate_stage_origin = time.perf_counter()
@@ -2826,6 +2983,17 @@ class SurfaceProbeLayout:
             ),
             max_density_multiplier=max_density_multiplier,
             adaptive_wse=bool(adaptive_wse),
+            density_driven=bool(density_driven),
+            density_scale=float(density_scale),
+            adaptive_mass_site_density=float(
+                effective_adaptive_mass_density
+            ),
+            density_reference_kernel_radius=float(
+                global_kernel_radius if density_driven else 0.0
+            ),
+            total_surface_area=total_surface_area,
+            total_adaptive_mass=total_adaptive_mass,
+            density_prepass_seconds=density_prepass_seconds,
             total_probe_count=int(probes.shape[0]),
             total_vertex_anchor_site_count=total_vertex_anchor_sites,
             total_vertex_anchor_probe_count=total_vertex_anchor_probes,
@@ -2833,52 +3001,6 @@ class SurfaceProbeLayout:
             seed=int(seed),
             sampler_backend=resolved_sampler_backend,
             build_profile=tuple(profile_samples),
-        )
-
-    def create_gpu_buffers(
-        self,
-        device: spy.Device,
-        profile_sink: list[tuple[str, float]] | None = None,
-    ) -> tuple[spy.Buffer, spy.Buffer, spy.Buffer, spy.Buffer]:
-        stage_start = time.perf_counter() if profile_sink is not None else 0.0
-
-        def profile_mark(label: str) -> None:
-            nonlocal stage_start
-            if profile_sink is None:
-                return
-            now = time.perf_counter()
-            profile_sink.append((label, now - stage_start))
-            stage_start = now
-
-        probe_buffer = device.create_buffer(
-            usage=spy.BufferUsage.shader_resource,
-            label="surface_probe_metadata",
-            data=np.ascontiguousarray(self.probes).view(np.uint8),
-        )
-        profile_mark("gpu_probe_metadata_buffer")
-        node_buffer = device.create_buffer(
-            usage=spy.BufferUsage.shader_resource,
-            label="surface_probe_nodes",
-            data=np.ascontiguousarray(self.nodes),
-        )
-        profile_mark("gpu_octree_buffer")
-        instance_buffer = device.create_buffer(
-            usage=spy.BufferUsage.shader_resource,
-            label="surface_probe_instances",
-            data=np.ascontiguousarray(self.instance_gpu_data).view(np.uint8),
-        )
-        profile_mark("gpu_instance_buffer")
-        triangle_vertex_probe_buffer = device.create_buffer(
-            usage=spy.BufferUsage.shader_resource,
-            label="surface_probe_triangle_vertex_map",
-            data=np.ascontiguousarray(self.triangle_vertex_probes),
-        )
-        profile_mark("gpu_triangle_vertex_map_buffer")
-        return (
-            probe_buffer,
-            node_buffer,
-            instance_buffer,
-            triangle_vertex_probe_buffer,
         )
 
     @staticmethod

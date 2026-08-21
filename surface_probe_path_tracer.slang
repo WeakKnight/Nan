@@ -1,8 +1,11 @@
 import common;
 import scene;
 import surface_probes;
+import surface_probe_field;
+import surface_probe_irradiance_field;
 
-RWByteAddressBuffer g_probe_irradiance;
+RWByteAddressBuffer g_probe_field_values;
+RWByteAddressBuffer g_probe_sample_counts;
 RWByteAddressBuffer g_probe_self_hit_counters;
 RWByteAddressBuffer g_probe_radial_moments;
 StructuredBuffer<SurfaceProbe> g_surface_probes;
@@ -32,12 +35,13 @@ struct SurfaceProbePath
 
 float3 load_cached_irradiance(uint probe_index)
 {
-    return surface_probe_load_irradiance(g_probe_irradiance, probe_index);
+    return surface_probe_load_irradiance(g_probe_field_values, probe_index);
 }
 
 uint load_cached_sample_count(uint probe_index)
 {
-    return surface_probe_load_sample_count(g_probe_irradiance, probe_index);
+    return surface_probe_load_sample_count(
+        g_probe_sample_counts, probe_index);
 }
 
 void store_accumulated_irradiance(uint probe_index, float3 irradiance_sample)
@@ -52,11 +56,12 @@ void store_accumulated_irradiance(uint probe_index, float3 irradiance_sample)
     float3 accumulated =
         lerp(previous_irradiance, irradiance_sample, weight);
 
-    uint destination = probe_index * SURFACE_PROBE_PAYLOAD_STRIDE;
-    g_probe_irradiance.Store(destination + 0, asuint(accumulated.x));
-    g_probe_irradiance.Store(destination + 4, asuint(accumulated.y));
-    g_probe_irradiance.Store(destination + 8, asuint(accumulated.z));
-    g_probe_irradiance.Store(destination + 12, next_count);
+    uint destination = probe_index * SURFACE_PROBE_IRRADIANCE_VALUE_STRIDE;
+    g_probe_field_values.Store(destination + 0, asuint(accumulated.x));
+    g_probe_field_values.Store(destination + 4, asuint(accumulated.y));
+    g_probe_field_values.Store(destination + 8, asuint(accumulated.z));
+    surface_probe_store_sample_count(
+        g_probe_sample_counts, probe_index, next_count);
 }
 
 void store_accumulated_self_hit_count(
